@@ -1,0 +1,64 @@
+total len: 2391341
+after strip imgs: 2391341
+== STYLE BLOCKS: 1
+:root{--blue:#014DB2;--green:#1E9E6A;--orange:#E8833A;--red:#D95555;--purple:#6C5CE7;
+--ink:#1F2329;--muted:#9AA0AB;--line:#EDEDED;--bg:#FAFAF8;--card:#FFFFFF}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#E7E7E4;font-family:"Noto Sans SC","PingFang SC","Microsoft YaHei",sans-serif;color:var(--ink);line-height:1.65}
+.wrap{max-width:1060px;margin:0 auto;padding:36px 24px 80px}
+h1{font-size:26px;letter-spacing:.5px}
+.sub{color:var(--muted);font-size:13.5px;margin:8px 0 4px}
+.badges{margin:10px 0 2px}
+.badges span{display:inline-block;font-size:12px;color:var(--blue);background:#E8F0FC;border-radius:999px;padding:2px 12px;margin:2px 6px 2px 0}
+.box{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:22px 26px;margin:16px 0}
+.box h2{font-size:17px;margin-bottom:8px}
+.box p,.box li{font-size:13.5px;color:#3A4048}
+.box ul{padding-left:18px;margin:6px 0}
+.toc{position:sticky;top:0;z-index:9;background:rgba(231,231,228,.96);border-bottom:1px solid var(--line);padding:10px 0;backdrop-filter:blur(8px)}
+.toc .wrap{padding:4px 24px;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.toc .grp{font-size:12px;color:var(--muted);font-weight:600}
+.toc a{font-size:12.5px;color:var(--ink);text-decoration:none;background:var(--card);border:1px solid var(--line);border-radius:999px;padding:3px 12px}
+.toc a:hover{color:var(--blue);border-color:var(--blue)}
+h2.sec{font-size:20px;margin:34px 0 6px}
+h2.sec small{font-size:12.5px;color:var(--muted);font-weight:400;margin-left:10px}
+.screen{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:20px 26px;margin:16px 0}
+.screen .head{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
+.screen h3{font-size:17px}
+.screen .node{font-size:12px;color:var(--muted)}
+.screen .tab{font-size:12px;color:var(--blue);background:#E8F0FC;border-radius:999px;padding:2px 10px}
+.note{font-size:13.5px;color:#4A5058;margin:8px 0 4px}
+.copy h4{font-size:13px;margin:14px 0 4px;color:var(--blue)}
+.copy ul{list-style:none}
+.copy li{font-size:13px;padding:3px 0;border-bottom:1px dashed #F0F0EE;color:#33373D}
+.copy li:last-child{border-bottom:0}
+.canvas{background:#fff;border:1px solid var(--line);border-radius:12px;padding:14px;margin-top:12px}
+.canvas svg{width:100%;height:auto;display:block;border-radius:8px}
+table{border-collapse:collapse;width:100%;font-size:13px;margin:8px 0}
+th,td{border:1px solid var(--line);padding:6px 10px;text-align:left;vertical-align:top}
+th{background:#F6F6F4;font-weight:600}
+.sw{display:inline-block;width:12px;height:12px;border-radius:3px;border:1px solid rgba(0,0,0,.12);vertical-align:-1px;margin-right:6px}
+footer{color:var(--muted);font-size:12.5px;margin-top:40px;line-height:1.8}
+---
+== TEXT CONTENT ==
+ AI智慧面试宝典 · App/小程序端原型（AI 可读版） 语义区 01 首页 02 题库中心 03 刷题考试 04 题目详情 05 简历 AI 分析 06 岗位检索 07 JD 精准定制 08 错题本 09 AI 模拟面试 10 求职看板 11 模考报告 12 简历体检报告 13 我的 像素区 图·01 图·02 图·03 图·04 图·05 图·06 图·07 图·08 图·09 图·10 图·11 图·12 图·13 AI智慧面试宝典 · App/小程序端原型（AI 可读版） 移动端（App / 小程序）原型 · 共 13 屏 · 每屏 390×844，与 Web 端功能对齐，并补充刷题考试、题目详情、模考报告、简历体检报告等移动场景。 
+13 屏 390×844 底部 Tab ×5 主蓝 #014DB2 一比一像素还原 自包含单文件 AI 阅读指南 文档结构 ：① 语义区 ——每屏一张卡：功能说明 + 全量文案清单（与设计稿逐字一致，条目顺序即视觉顺序）；② 像素还原区 ——每屏一张与设计画布一比一的矢量图（SVG）。 像素还原区说明 ：图中文字已矢量化为轮廓路径，无法直接复制文本； 提取文案一律以语义区清单为准 。清单中的「✓ / ○ / › / ｜ / ＋」等符号为元素状态或分组标注，并非画布文字。 投喂建议 ：可将本文件直接交给 AI 用于生成前端代码、撰写 PRD、评审交互或编写测试用例。生成代码时：以语义区为信息架构与文案来源，以像素还原区为视觉与布局参照。 
+设计 tokens 与通用组件 ：见下表，代码实现时应全局复用。 设计 Tokens Token 值 用途 --blue #014DB2 品牌主蓝：主按钮、激活态、链接、Logo、进度条 --bg #FAFAF8 页面背景（暖白） --card #FFFFFF + 1px #EDEDED 边框 卡片容器，圆角 16px --ink #1F2329 主文字 --muted #9AA0AB 辅助/次要文字、未激活项 --green #1E9E6A 成功 / 正确 / 已完成 --orange #E8833A 提醒 / 连击 / 待巩固 --red #D95555 错误 / 警示 --purple #6C5CE7 
+AI / 模拟面试点缀 字体 Noto Sans SC 兜底 PingFang SC / Microsoft YaHei 圆角 卡片 16px · 按钮 12px · 小标签 8px — 间距档位 8 / 12 / 16 / 20 / 24 / 32px — 本文件为「AI智慧面试宝典」App/小程序端高保真原型的 AI 可读导出版：语义区提供结构化功能说明与逐字文案，像素还原区提供与设计画布一致的矢量视觉参照。 通用组件：底部 Tab Bar（组件 11:91） Tab 说明 首页 / 题库 / 错题本 / 模拟面试 / 我的 双态图标（灰 #9AA0AB / 蓝 #014DB2）+ 文字标签；激活项为蓝色并带顶部指示条。仅首页、题库中心、错题本、我的四屏含 
+Tab Bar；其余屏为推入式二级页（返回式导航栏）。 语义区 功能说明 + 全量文案（AI 主要读这里） App 01 · 首页 node 11:137 · 390×844 底部 Tab：首页 激活 功能说明： 移动端首页：问候 + 连击激励横幅 + 三大出题功能入口 + 今日学习计划 + 主 CTA 与学习统计。 状态栏与问候 状态栏：时间 / 信号 / 电量（示意图形，未列入逐字文案） 晚上好，林晓 9月22日 · 周二 连击横幅 连续学习 12 天 · 今日已完成 3/5 项计划 功能入口 ×3 简历 AI 分析出题 — 上传简历，生成专属题库 › 岗位检索出题 — 检索 Boss 在招岗位出题 
+› JD 精准定制 — 链接/截图 + 简历定制题目 › 今日学习计划 全部 › ✓ 产品经理核心题集 · 刷 20 题（15 分钟） ✓ 错题复习 · 艾宾浩斯第 2 天（10 分钟） ○ AI 模拟面试 · 行为面 1 场（25 分钟） 主操作 主按钮：开始今日刷题 数据统计 128 本周刷题 76% 正确率 23 待复习 底部导航（组件 11:91） 首页（激活）· 题库 · 错题本 · 模拟面试 · 我的 App 02 · 题库中心 node 11:202 · 390×844 底部 Tab：题库 激活 功能说明： 题库中心：题集列表，支持搜索与按来源筛选，卡片显示完成进度与进度条。 页头 
+题库中心 共 12 个题集 · 486 道题 · AI 持续生成 搜索框：搜索题集 筛选 Tab 全部 · 简历生成 · 岗位检索 · JD定制（当前：全部） 题集卡 ×4 简历生成｜产品经理核心题集｜32 题 · 完成 18/32 JD定制｜字节跳动 · 后端开发｜45 题 · 完成 30/45 模拟面试｜行为面 STAR 专场｜20 题 · 完成 8/20 简历生成｜前端工程师全攻略｜40 题 · 已完成 40/40 底部导航 首页 · 题库（激活）· 错题本 · 模拟面试 · 我的 App 03 · 刷题考试 node 11:242 · 390×844 功能说明： 刷题考试：选择题作答界面，含计时、四个选项、上一题/下一题与答题卡（可跳题，交卷前可修改答案）。 
+顶栏 退出 第 3 / 20 题 计时 08:32 题面 产品经理核心题集 在制定产品 roadmap 时，以下哪种优先级评估方法最适合资源有限的初创团队？ 选项 ×4 A RICE 评分模型 B MoSCoW 法则 C KANO 模型分类 D SWOT 分析 操作 上一题 下一题 答题卡 答题卡 题号 1 - 5（已答 2 题 · 未答 18 题 · 交卷前可修改答案） App 04 · 题目详情 node 11:274 · 390×844 功能说明： 题目详情：复盘单题 —— 正确答案与全站答对率、参考回答与要点解析，可一键加入错题本。 顶栏 返回 题目详情 题面 在制定产品 roadmap 
+时，以下哪种优先级评估方法最适合资源有限的初创团队？ 答案信息 正确答案 B 全站答对率 62% 选项 A RICE 评分模型 B MoSCoW 法则（正确项高亮） 解析 答案解析 / 参考回答 初创团队资源有限，MoSCoW 通过 Must/Should/Could/Won't 四级划分，能在需求远超资源时快速砍掉非核心项；RICE 需要较准确的量化预估数据，初创期数据不足时误差大。 参考回答要点：先说明选择理由（资源约束 → 快速分层），再结合一个真实取舍案例，最后补充团队对齐机制（每周 roadmap 评审）。 底部操作 主按钮：加入错题本 App 05 · 简历 AI 分析 node 11:303 
+· 390×844 功能说明： 简历 AI 分析（App 版）：三步流程上传简历，展示解析摘要与能力维度，生成专属题库。 页头 简历 AI 分析 上传简历，AI 生成覆盖广、有深度的专属题库 流程步骤 1 上传简历（当前） 2 AI 解析 3 生成题库 上传区 点击或拖拽上传简历 林晓-产品经理-简历.pdf 状态：已解析 解析摘要 工作年限：3 年 目标岗位：产品经理 预计题量：120 题 能力维度评估 项目管理 85 数据分析 72 行业认知 68 底部 覆盖 L1 基础 → L3 深度 · 每题附参考回答 + 解析 主按钮：生成专属题库 App 06 · 岗位检索 node 11:355 
+· 390×844 功能说明： 岗位检索出题（App 版）：搜索岗位 → 设置题量难度 → 从 Boss 直聘在招岗位卡生成题目。 页头与搜索 岗位检索出题 搜索词：产品经理 按钮：检索 生成设置 题量 50 难度 混合 附参考回答+解析 数据来自 Boss 直聘 · 实时检索 · 缓存 7 天 岗位卡 ×3 高级产品经理｜25-50K｜字节跳动 · 北京 · 3-5年 · 本科｜B端产品 · 增长策略｜生成题目 产品经理（AI 方向）｜20-40K｜腾讯 · 深圳 · 1-3年 · 本科｜AI 产品 · C端｜生成题目 产品经理｜18-35K｜美团 · 上海 · 3-5年 · 本科｜交易平台 
+· 策略产品｜生成题目 App 07 · JD 精准定制 node 11:393 · 390×844 功能说明： JD 精准定制（App 版）：粘贴链接 / 截图 / 文本输入 JD，解析岗位与匹配度后结合简历生成定制题库。 页头 JD 精准定制 岗位链接/截图 + 你的简历，精准出题 输入方式 Tab 粘贴链接（当前）· 上传截图 · 粘贴文本 输入区 链接输入：https://www.zhipin.com/job_detail/… JD 文本：岗位职责：负责交易平台核心链路的产品规划与迭代，挖掘用户需求输出 PRD，协同研发设计推进落地，跟踪核心指标优化转化漏斗… 解析结果 高级产品经理 字节跳动 
+· 电商平台部 简历匹配度 78% JD 核心要求：产品规划 · 数据分析 · 跨团队协同 · 增长策略 结合我的简历生成题目（勾选） 主操作 主按钮：生成定制题库 App 08 · 错题本 node 11:426 · 390×844 底部 Tab：错题本 激活 功能说明： 错题本（App 版）：待复习 / 到期 / 已掌握统计 + 错题卡 + 艾宾浩斯复习计划与今日复习入口。 页头与统计 错题本 待复习 23 今日到期 8 已掌握 156 错题卡 ×2 概念不清｜产品经理核心题集｜在制定产品 roadmap 时，以下哪种优先级评估方法最适合资源有限的初创团队？｜错误 3 次 · 下次复习 今天｜立即复习 
+› 审题失误｜字节跳动 · 后端开发｜MySQL 索引失效的场景中，以下哪一项描述是不正确的？｜错误 2 次 · 下次复习 今天｜立即复习 › 艾宾浩斯计划卡 艾宾浩斯复习计划 · 今天 8 题到期 第 2 天 6 题 · 第 4 天 5 题 · 第 7 天 4 题 · 第 15 天 3 题，复习通过后自动归档「已掌握」。 主操作 主按钮：开始今日复习（8 题） 底部导航 首页 · 题库 · 错题本（激活）· 模拟面试 · 我的 App 09 · AI 模拟面试 node 11:460 · 390×844 功能说明： AI 模拟面试（App 版）：与 AI 面试官实时问答，STAR 实时评分反馈，支持跳过 
+/ 重答 / 提交。 顶栏 模拟面试 · 产品经理 第 3/10 题 结束 AI 提问 AI 标识（紫色） 请结合你最近负责的一个项目，讲讲你是如何从 0 到 1 推进产品上线的？ 提示：建议用 STAR 法则 · 建议时长 2 分钟 作答区 正在聆听你的回答… 00:42 跳过 重新作答 主按钮：提交回答 实时评估（STAR） 情境 8.5 行动 8.2 结果 7.5 App 10 · 求职看板 node 11:507 · 390×844 功能说明： 求职看板（App 版）：投递与面试进度卡片流（已投递 / 面试两组），可添加投递。 页头 求职看板 按钮：添加投递 11 个在投岗位 · 2 场即将到来的面试 
+组：已投递（5） 产品经理 · 美团｜09-18 投递｜等待反馈 产品专员 · 滴滴出行｜09-20 投递｜等待反馈 组：面试（3） 高级产品经理 · 字节跳动｜三面 09-24 14:00｜明天面试 产品经理（AI）· 腾讯｜二面 09-26 10:30｜待面试 App 11 · 模考报告 node 11:544 · 390×844 功能说明： 模考报告：模考总分与超越百分位、三维度得分、正确率与用时，引导查看错题解析。 结果区 模考报告 82 分（环形分数） 产品经理模考 · 超越全站 74% 的考生 维度得分 专业知识 88 案例分析 80 行业认知 70 统计 76% 正确率 18:24 
+总用时 主操作 主按钮：查看错题解析 App 12 · 简历体检报告 node 11:578 · 390×844 功能说明： 简历体检报告：体检评分与结论、亮点与待改进清单、AI 优化建议，支持 AI 一键优化简历。 结果区 简历体检报告 86（体检分） 整体优秀 · 可冲刺一线大厂简历筛选 简历亮点 ✓ 项目经历均有量化结果（DAU +35%、转化率 +12%） ✓ 技能栈与目标岗位 JD 高度匹配 待改进 ! 第二段经历缺少背景与职责描述 ! 自我评价偏空泛，建议替换为差异化标签 ! 教育时间线存在 2 个月空窗，需补充说明 AI 优化建议 把「负责 XX 项目」改写为 STAR 结构：背景 
+→ 动作 → 量化结果；数据产品经验可前置突出，匹配 JD 定向岗位。 主操作 主按钮：AI 一键优化简历 App 13 · 我的 node 11:595 · 390×844 底部 Tab：我的 激活 功能说明： 我的：个人资料、学习统计与设置菜单。 个人区 头像「林」 林晓 目标岗位：产品经理 · 3 年经验 统计 1,024 累计刷题 78% 正确率 12 天 连续学习 菜单 学习报告 › 简历管理 · 2 份 › 复习提醒 · 每晚 8 点 › 设置 › 底部导航 首页 · 题库 · 错题本 · 模拟面试 · 我的（激活） 像素还原区 与设计画布逐像素一致的矢量图（视觉参照） App 01 
+· 首页 node 11:137 · 390×844 · 一比一矢量还原 App 02 · 题库中心 node 11:202 · 390×844 · 一比一矢量还原 App 03 · 刷题考试 node 11:242 · 390×844 · 一比一矢量还原 App 04 · 题目详情 node 11:274 · 390×844 · 一比一矢量还原 App 05 · 简历 AI 分析 node 11:303 · 390×844 · 一比一矢量还原 App 06 · 岗位检索 node 11:355 · 390×844 · 一比一矢量还原 App 07 · JD 精准定制 node 11:393 · 
+390×844 · 一比一矢量还原 App 08 · 错题本 node 11:426 · 390×844 · 一比一矢量还原 App 09 · AI 模拟面试 node 11:460 · 390×844 · 一比一矢量还原 App 10 · 求职看板 node 11:507 · 390×844 · 一比一矢量还原 App 11 · 模考报告 node 11:544 · 390×844 · 一比一矢量还原 App 12 · 简历体检报告 node 11:578 · 390×844 · 一比一矢量还原 App 13 · 我的 node 11:595 · 390×844 · 一比一矢量还原 来源：Ardot 
+设计画布 https://ardot.tencent.com/file/728571140088667（App 页 0:1 / Web 页 2:905）· 导出日期 2026-09-23 · 屏幕节点 ID：11:137 / 11:202 / 11:242 / 11:274 / 11:303 / 11:355 / 11:393 / 11:426 / 11:460 / 11:507 / 11:544 / 11:578 / 11:595。 「AI智慧面试宝典」：驾考宝典式 AI 面试备考产品 —— 简历 AI 分析出题 · 岗位检索出题 · JD 精准定制 · 选择题考试（附参考回答与解析）· 错题本（艾宾浩斯复习）· 
+AI 模拟面试 · 求职看板。  

@@ -1,0 +1,50 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --blue: #014db2;
+  --green: #1e9e6a;
+  --orange: #e8833a;
+  --red: #d95555;
+  --purple: #6c5ce7;
+  --ink: #1f2329;
+  --muted: #9aa0ab;
+  --line: #ededed;
+  --bg: #fafaf8;
+  --card: #ffffff;
+}
+
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: "Noto Sans SC", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  line-height: 1.65;
+}
+
+@layer components {
+  .card {
+    @apply rounded-card border border-line bg-card;
+  }
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-btn px-5 py-2.5 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  .btn-primary {
+    @apply btn bg-brand text-white hover:bg-brand-dark;
+  }
+  .btn-secondary {
+    @apply btn border border-line bg-card text-ink hover:border-brand hover:text-brand;
+  }
+  .tag {
+    @apply inline-flex items-center rounded-tag px-2 py-0.5 text-xs;
+  }
+  .input {
+    @apply w-full rounded-btn border border-line bg-card px-4 py-2.5 text-sm outline-none transition-colors placeholder:text-muted focus:border-brand;
+  }
+  .chip {
+    @apply cursor-pointer rounded-full border border-line bg-card px-4 py-1.5 text-sm text-ink transition-colors hover:border-brand;
+  }
+  .chip-active {
+    @apply border-brand bg-brand-light font-medium text-brand;
+  }
+}

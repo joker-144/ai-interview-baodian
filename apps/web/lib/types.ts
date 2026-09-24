@@ -33,6 +33,63 @@ export interface UserProfile {
   streak: number;
   totalAnswered: number;
   correctRate: number;
+  /** 脱敏手机号（138****6021），仅我的页展示 */
+  phone?: string;
+  wechatBound?: boolean;
+}
+
+/** 一期只开放复习提醒；学习报告 / 通知管理 / 数据导出随承载功能落二期 */
+export interface UserSettings {
+  reviewReminderEnabled: boolean;
+  /** HH:mm，24 小时制 */
+  reviewReminderTime: string;
+}
+
+export type DeactivationStatus = "cooling_off" | "executed";
+
+export interface DeactivationInfo {
+  status: DeactivationStatus;
+  requestedAt: string;
+  coolingOffUntil: string;
+  remainingDays: number;
+  reason: string;
+  /** 注销会删除的数据范围（申请前向用户明示） */
+  scopes: string[];
+  revocable: boolean;
+}
+
+/** 我的页一次拉齐：资料 + 三统计卡 + 扩展计数 + 偏好 + 注销态 */
+export interface MeProfile {
+  profile: UserProfile;
+  settings: UserSettings;
+  stats: {
+    answered: number;
+    correctRate: number;
+    streak: number;
+    pendingReview: number;
+    mastered: number;
+  };
+  counts: {
+    sets: number;
+    favorites: number;
+    questions: number;
+  };
+  deactivation: DeactivationInfo | null;
+}
+
+export interface ProfileUpdate {
+  name?: string;
+  avatarText?: string;
+  targetRole?: string;
+  years?: number;
+}
+
+export interface DeletionResult {
+  ok: boolean;
+  executedAt: string;
+  /** 各类数据实际清理条数 */
+  deleted: Record<string, number>;
+  detail: string;
 }
 
 export interface PlanTask {
@@ -95,3 +152,130 @@ export interface GenerateProgress {
   currentDimension: string;
   done: boolean;
 }
+
+/* ---------------- 管理端：模型配置（产品文档 4.6.1） ---------------- */
+
+/** 四类分层模型 + 语音，对应架构图 LLM 层 */
+export type LlmLayer = "primary" | "light" | "vision" | "embedding" | "voice";
+
+export interface LlmConfig {
+  layer: LlmLayer;
+  label: string;
+  usage: string;
+  provider: string;
+  modelName: string;
+  /** 仅掩码（sk-****abcd），接口永不返回明文 */
+  apiKeyMasked: string;
+  hasKey: boolean;
+  baseUrl: string;
+  params: Record<string, number | string>;
+  fallbackModel: string;
+  enabled: boolean;
+  updatedAt: string;
+  updatedBy: string;
+}
+
+export interface LlmConfigUpdate {
+  provider?: string;
+  modelName?: string;
+  /** 留空或回传掩码 = 不修改 */
+  apiKey?: string;
+  baseUrl?: string;
+  params?: Record<string, number | string>;
+  fallbackModel?: string;
+  enabled?: boolean;
+}
+
+export interface LlmTestResult {
+  ok: boolean;
+  latencyMs?: number;
+  tokens?: number;
+  error?: string;
+  /** 成功时的补充信息（如本地推理维度 / 相似度校验） */
+  detail?: string;
+}
+
+/** 供应商：选定即自动回填 baseUrl（可手改），capabilities 决定能承接哪些分层 */
+export interface LlmProvider {
+  id: string;
+  label: string;
+  /** cloud=云端 API / selfhost=本机自托管 / local=项目内置权重 / custom=自定义网关 */
+  kind: "cloud" | "selfhost" | "local" | "custom";
+  baseUrl: string;
+  requiresKey: boolean;
+  keyPlaceholder: string;
+  capabilities: LlmLayer[];
+  hint: string;
+}
+
+export interface ModelOption {
+  id: string;
+  label?: string;
+  ownedBy?: string;
+  kind?: string;
+}
+
+/** 模型发现结果：source=remote 实时拉取 / local 本地清单 / static 常用候选兜底 / none 无候选 */
+export interface ModelDiscoverResult {
+  ok: boolean;
+  source: "remote" | "local" | "static" | "none";
+  models: ModelOption[];
+  error?: string | null;
+}
+
+/** 项目内已下载的本地模型（apps/api/models/） */
+export interface LocalModelInfo {
+  modelId: string;
+  label: string;
+  kind: string;
+  repo: string;
+  dimensions?: number | null;
+  path: string;
+  sizeMB: number;
+  downloadedAt: string;
+  desc: string;
+}
+
+export interface LocalModelList {
+  modelsDir: string;
+  downloadCommand: string;
+  updatedAt: string;
+  models: LocalModelInfo[];
+}
+
+export interface AuditEntry {
+  at: string;
+  actor: string;
+  action: string;
+  layer: string;
+  detail: string;
+}
+
+/** 审计动作中文名：除「模型发现」外全部打点（与后端 AUDIT_ACTIONS 同构） */
+export const AUDIT_ACTION_LABEL: Record<string, string> = {
+  update_config: "修改配置",
+  test_conn: "连通性自测",
+  rollback_config: "版本回滚",
+  migrate_model: "模型迁移",
+};
+
+/** 分层差异化参数的中文标签与输入类型（未收录的 key 直接展示原名、按文本处理） */
+export const LLM_PARAM_META: Record<
+  string,
+  { label: string; kind: "number" | "text"; step?: number; min?: number; max?: number; hint?: string }
+> = {
+  temperature: { label: "温度", kind: "number", step: 0.1, min: 0, max: 2, hint: "出题建议 0.3~0.5，校验类建议 0" },
+  maxTokens: { label: "最大 tokens", kind: "number", step: 256, min: 1 },
+  timeoutSec: { label: "超时（秒）", kind: "number", step: 5, min: 1 },
+  concurrency: { label: "并发上限", kind: "number", step: 1, min: 1, hint: "超出后排队，避免触发供应商限流" },
+  dimensions: {
+    label: "向量维度",
+    kind: "number",
+    step: 256,
+    min: 1,
+    hint: "变更后需重建 pgvector 索引",
+  },
+  sampleRate: { label: "采样率（Hz）", kind: "number", step: 1000, min: 1 },
+  ttsVoice: { label: "TTS 音色", kind: "text" },
+  ttsModel: { label: "TTS 模型", kind: "text" },
+};

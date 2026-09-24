@@ -15,6 +15,7 @@ dist/
 build/
 .turbo/
 .npm-cache/
+*.tsbuildinfo
 
 # Env & secrets
 .env
@@ -33,3 +34,27 @@ Thumbs.db
 *.sqlite3
 *.log
 uploads/
+
+# 本地模型权重：入仓跟踪（团队共享、免重复下载；用 scripts/download_models.py 拉取到 apps/api/models/）
+# 下方按扩展名全量忽略权重类文件后，再用否定规则放行项目内模型目录
+/models/
+*.safetensors
+*.onnx
+*.gguf
+*.pt
+*.pth
+*.ckpt
+*.msgpack
+!apps/api/models/**
+
+# 管理端真实配置（含混淆 Key）：不入仓；仓内是同目录模板 llm.json.example（Key 全空）
+apps/api/config/llm.json
+
+# 模型下载缓存（HuggingFace / ModelScope）
+.hf-cache/
+.cache/
+
+# 测试验证产物（截图 / 临时输出）：用后即删，不入仓
+scripts/_*.txt
+scripts/_*.ps1
+scripts/*.png

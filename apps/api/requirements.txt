@@ -1,0 +1,16 @@
+# AI 面试宝典 · 后端一期依赖
+fastapi>=0.115
+# 注：不用 uvicorn[standard]，Python 3.14 下 httptools 暂无预编译包
+uvicorn>=0.30
+pydantic>=2.7
+
+# 本地向量模型推理（Embedding 层默认走项目内置模型，离线、零 API 成本）。
+# torch 体积较大；若只用云端 Embedding 可不装，管理端自测会给出明确提示。
+sentence-transformers>=3.0
+# scripts/download_models.py 下载权重时使用（多源直连 + 断点续传）
+requests>=2.31
+# 二期起接入（预留）：
+# sqlalchemy>=2.0
+# asyncpg
+# celery[redis]
+# langgraph

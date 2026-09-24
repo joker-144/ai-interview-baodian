@@ -1,7 +1,7 @@
 # 本地模型目录（apps/api/models/）
 
-存放**可直接在本项目内离线运行**的模型权重。除本文件外，该目录整体被 `.gitignore` 忽略
-（权重体积大、有各自开源许可，不入仓）——克隆项目后需执行一次下载脚本。
+存放**可直接在本项目内离线运行**的模型权重。该目录**整体入仓跟踪**（团队共享、
+克隆即用、免重复下载）；如需重新下载或新增模型，执行下载脚本即可。
 
 ## 下载
 
@@ -22,7 +22,7 @@ python scripts/download_models.py --source hf-mirror    # 指定下载源
 
 ```
 apps/api/models/
-├── README.md                 # 本文件（唯一入仓的文件）
+├── README.md                 # 本文件
 ├── manifest.json             # 下载脚本生成：本地模型清单，管理端「本地模型」列表的数据源
 └── <model_id>/               # 例：bge-small-zh-v1.5/
     ├── config.json / modules.json / 1_Pooling/config.json

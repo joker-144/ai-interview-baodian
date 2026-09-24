@@ -1,9 +1,9 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname, useRouter } from "next/navigation";
+import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
-import { getUser, isLoggedIn, logout } from "@/lib/api";
+import { getMe, isLoggedIn } from "@/lib/api";
 import type { UserProfile } from "@/lib/types";
 
 const NAV_ITEMS = [
@@ -19,17 +19,17 @@ const NAV_ITEMS = [
 
 export function TopNav() {
   const pathname = usePathname();
-  const router = useRouter();
   const [user, setUser] = useState<UserProfile | null>(null);
   const [loggedIn, setLoggedIn] = useState(false);
 
   useEffect(() => {
     setLoggedIn(isLoggedIn());
-    getUser().then(setUser);
+    // 走 getMe 而非 getUser：资料在「我的」页修改后，顶栏头像与称呼需同步
+    getMe().then((m) => setUser(m.profile));
   }, [pathname]);
 
-  // 登录页不渲染顶栏
-  if (pathname === "/login") return null;
+  // 登录页不渲染顶栏；管理端（/admin）为内部工具，使用自带顶栏且不出现在 C 端导航
+  if (pathname === "/login" || pathname.startsWith("/admin")) return null;
 
   const active = (href: string) =>
     href === "/" ? pathname === "/" : pathname.startsWith(href);
@@ -88,18 +88,17 @@ export function TopNav() {
             </svg>
             <span className="absolute -right-0.5 -top-0.5 h-2 w-2 rounded-full bg-danger" />
           </button>
-          {/* 头像 / 登录 */}
+          {/* 头像：进入我的页（P14）——资料 / 统计 / 复习提醒 / 退出登录 / 注销均在该页 */}
           {loggedIn && user ? (
-            <button
-              onClick={async () => {
-                await logout();
-                router.push("/login");
-              }}
-              title="点击退出登录"
-              className="flex h-8 w-8 items-center justify-center rounded-full bg-ink text-sm text-white"
+            <Link
+              href="/me"
+              title="我的"
+              className={`flex h-8 w-8 items-center justify-center rounded-full text-sm text-white transition-opacity hover:opacity-85 ${
+                active("/me") ? "bg-brand ring-2 ring-brand/30" : "bg-ink"
+              }`}
             >
               {user.avatarText}
-            </button>
+            </Link>
           ) : (
             <Link href="/login" className="btn-primary !px-4 !py-1.5 text-sm">
               登录

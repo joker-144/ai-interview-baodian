@@ -4,6 +4,7 @@ import type {
   QuestionSet,
   ResumeAnalysis,
   UserProfile,
+  UserSettings,
   WrongItem,
 } from "./types";
 
@@ -17,7 +18,28 @@ export const MOCK_USER: UserProfile = {
   streak: 12,
   totalAnswered: 1024,
   correctRate: 78,
+  phone: "138****6021",
+  wechatBound: true,
 };
+
+/** P14 我的页偏好（一期仅复习提醒） */
+export const MOCK_USER_SETTINGS: UserSettings = {
+  reviewReminderEnabled: true,
+  reviewReminderTime: "20:00",
+};
+
+/** 注销冷静期（天）：期内可撤回，逾期不可恢复 */
+export const DEACTIVATION_COOLING_DAYS = 7;
+
+/** 注销时删除的数据范围（二次确认弹窗向用户明示） */
+export const DELETION_SCOPES = [
+  "个人资料与账号绑定（手机号 / 微信）",
+  "题集与刷题进度、答题记录",
+  "错题本与复习调度队列",
+  "收藏与笔记",
+  "简历原文件与解析产物",
+  "学习统计与周报数据",
+];
 
 /** ================= 今日学习计划（原型 P1 文案） ================= */
 

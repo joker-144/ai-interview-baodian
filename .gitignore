@@ -50,6 +50,9 @@ uploads/
 # 管理端真实配置（含混淆 Key）：不入仓；仓内是同目录模板 llm.json.example（Key 全空）
 apps/api/config/llm.json
 
+# 题库 MySQL 真实连接串（含明文密码）：不入仓；仓内是同目录模板 db.json.example（password 为空）
+apps/api/config/db.json
+
 # 模型下载缓存（HuggingFace / ModelScope）
 .hf-cache/
 .cache/

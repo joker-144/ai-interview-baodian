@@ -1,0 +1,10 @@
+{
+  "_note": "MySQL 题库持久化连接配置模板：password 一律留空。真实配置为同目录 db.json（.gitignore 忽略，含明文密码，不入仓）；本文件入仓，供团队对齐字段结构。使用前先手动执行 sql/schema.sql 建库；enabled=false 或连不上时后端自动退回内存模式（重启丢数据），不影响其余功能。",
+  "enabled": true,
+  "host": "127.0.0.1",
+  "port": 3306,
+  "user": "root",
+  "password": "",
+  "database": "ai_interview_baodian",
+  "charset": "utf8mb4"
+}

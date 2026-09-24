@@ -16,26 +16,27 @@ def list_questions(
     set_id: str | None = Query(default=None, alias="setId"),
 ) -> list[dict]:
     if set_id is None:
-        return store.QUESTIONS_SEED
-    return [q for q in store.QUESTIONS_SEED if q["setId"] == set_id]
+        return store.all_questions()
+    return [q for q in store.all_questions() if q["setId"] == set_id]
 
 
 @router.get("/{question_id}", response_model=Question)
 def get_question(question_id: str) -> dict:
-    for q in store.QUESTIONS_SEED:
-        if q["id"] == question_id:
-            return q
-    raise HTTPException(status_code=404, detail="题目不存在")
+    question = store.find_question(question_id)
+    if question is None:
+        raise HTTPException(status_code=404, detail="题目不存在")
+    return question
 
 
 @router.get("/{question_id}/site-stats", response_model=SiteStats)
 def site_stats(question_id: str) -> dict:
     """全站答对率（供题目详情页独立刷新）。
 
-    一期无 answer_events 表，样本量按题目 id 稳定派生；接 PostgreSQL 后改为
+    一期无 answer_events 表：种子题按题目 id 稳定派生样本量，引擎生成的题
+    （siteCorrectRate=None）样本量不足，按低样本保护不展示；接 PostgreSQL 后改为
     `SELECT count(*), avg(is_correct) FROM answer_events WHERE question_id = ...`。
     """
-    question = next((q for q in store.QUESTIONS_SEED if q["id"] == question_id), None)
+    question = store.find_question(question_id)
     if question is None:
         raise HTTPException(status_code=404, detail="题目不存在")
 

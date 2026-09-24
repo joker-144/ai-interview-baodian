@@ -94,7 +94,7 @@ def _build() -> MeProfile:
         counts={
             "sets": len(store.state.sets),
             "favorites": len(store.state.favorites.get(USER_ID, [])),
-            "questions": len(store.QUESTIONS_SEED),
+            "questions": len(store.all_questions()),
         },
         deactivation=_deactivation_info(),
     )

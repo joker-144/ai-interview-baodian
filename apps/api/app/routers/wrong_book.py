@@ -64,7 +64,7 @@ def add_wrong(body: WrongAddRequest) -> dict:
         item["reason"] = body.reason  # 已存在则仅更新错因（手动强化入口）
         return item
 
-    question = next((q for q in store.QUESTIONS_SEED if q["id"] == body.questionId), None)
+    question = store.find_question(body.questionId)
     if question is None:
         raise HTTPException(status_code=404, detail="题目不存在")
 

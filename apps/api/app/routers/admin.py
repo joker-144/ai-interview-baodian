@@ -11,7 +11,6 @@
 热生效由 Redis 发布订阅通知各 worker 重载。
 """
 
-import base64
 import random
 from datetime import datetime
 from pathlib import Path
@@ -20,6 +19,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 
 from app import llm_config_file, local_models, providers, store
 from app.config import settings
+from app.keys import deobfuscate, mask_key, obfuscate
 from app.schemas import (
     AuditEntry,
     LlmConfigOut,
@@ -47,36 +47,7 @@ def verify_admin(x_admin_token: str | None = Header(default=None)) -> str:
 
 
 # ---------------- Key 掩码与混淆存储 ----------------
-
-
-def mask_key(key: str) -> str:
-    """sk-1234567890abcd -> sk-****abcd；空 Key 返回空串。"""
-    if not key:
-        return ""
-    if len(key) <= 8:
-        return "****"
-    return f"{key[:3]}****{key[-4:]}"
-
-
-def _obfuscate(key: str) -> str:
-    """存储态混淆（XOR + base64）。
-
-    注意：这是**混淆而非加密**，仅避免明文落库/落日志。生产必须换 KMS 或
-    Fernet（cryptography），密钥由环境注入且不进代码仓（见 config.key_secret）。
-    """
-    if not key:
-        return ""
-    secret = settings.key_secret.encode()
-    xored = bytes(b ^ secret[i % len(secret)] for i, b in enumerate(key.encode()))
-    return base64.urlsafe_b64encode(xored).decode()
-
-
-def _deobfuscate(stored: str) -> str:
-    if not stored:
-        return ""
-    secret = settings.key_secret.encode()
-    raw = base64.urlsafe_b64decode(stored.encode())
-    return bytes(b ^ secret[i % len(secret)] for i, b in enumerate(raw)).decode()
+# 实现见 app/keys.py：业务侧真实调用（app/llm.py）需要共用同一套解码口径
 
 
 def _now() -> str:
@@ -135,7 +106,7 @@ def _to_out(layer: str, notice: str | None = None) -> LlmConfigOut:
     meta = _layer_meta(layer)
     cfg = store.state.llm_config[layer]
     _migrate_model(layer, cfg)
-    plain = _deobfuscate(cfg.get("apiKey", ""))
+    plain = deobfuscate(cfg.get("apiKey", ""))
     return LlmConfigOut(
         layer=layer,  # type: ignore[arg-type]
         label=meta["label"],
@@ -192,7 +163,7 @@ def update_llm_config(
     # apiKey：不回传或回传掩码 = 未修改（永不接收/回显明文）
     notice = None
     if body.apiKey and "****" not in body.apiKey:
-        cfg["apiKey"] = _obfuscate(body.apiKey)
+        cfg["apiKey"] = obfuscate(body.apiKey)
         changes.append(f"apiKey: → {mask_key(body.apiKey)}")
 
     cfg["updatedAt"] = _now()
@@ -240,7 +211,7 @@ def test_llm_config(layer: LlmLayer, actor: str = Depends(verify_admin)) -> LlmT
     """
     _layer_meta(layer)
     cfg = store.state.llm_config[layer]
-    plain = _deobfuscate(cfg.get("apiKey", ""))
+    plain = deobfuscate(cfg.get("apiKey", ""))
 
     if cfg["provider"] == providers.LOCAL_PROVIDER:
         try:
@@ -338,7 +309,7 @@ def discover_models(body: ModelDiscoverRequest, actor: str = Depends(verify_admi
     key_source = "入参"
     # 页面未重填 Key 时（回显为掩码），回落到该分层已存密钥，避免“换供应商就得重贴 Key”
     if not api_key and body.layer:
-        api_key = _deobfuscate(store.state.llm_config[body.layer].get("apiKey", ""))
+        api_key = deobfuscate(store.state.llm_config[body.layer].get("apiKey", ""))
         key_source = "已存密钥"
 
     base_url = body.baseUrl.strip() or provider["baseUrl"]

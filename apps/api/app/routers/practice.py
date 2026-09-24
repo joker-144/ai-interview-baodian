@@ -14,10 +14,10 @@ router = APIRouter(tags=["practice"])
 
 
 def _find_question(question_id: str) -> dict:
-    for q in store.QUESTIONS_SEED:
-        if q["id"] == question_id:
-            return q
-    raise HTTPException(status_code=404, detail="题目不存在")
+    question = store.find_question(question_id)
+    if question is None:
+        raise HTTPException(status_code=404, detail="题目不存在")
+    return question
 
 
 def _upsert_wrong_item(question: dict) -> None:

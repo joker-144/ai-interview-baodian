@@ -3,47 +3,88 @@
 import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { PageHeader, ProgressBar } from "@/components/ui";
-import { getResumeAnalysis, streamGenerate, uploadAndParseResume } from "@/lib/api";
+import {
+  getResumeAnalysis,
+  startGenerate as startGenerateTask,
+  streamGenerate,
+  uploadAndParseResume,
+} from "@/lib/api";
 import type { GenerateProgress, ResumeAnalysis } from "@/lib/types";
 
 type Stage = "upload" | "parsing" | "parsed" | "generating" | "done";
 
 const STEPS = ["上传简历", "AI 解析", "生成题库"];
 
+/** 后端兜底题量（正常情况下始终使用 analysis.estimatedCount） */
+const FALLBACK_COUNT = 40;
+
 export default function ResumePage() {
   const router = useRouter();
   const [stage, setStage] = useState<Stage>("upload");
   const [analysis, setAnalysis] = useState<ResumeAnalysis | null>(null);
   const [progress, setProgress] = useState<GenerateProgress | null>(null);
+  const [error, setError] = useState("");
   const [dragOver, setDragOver] = useState(false);
+  const [picked, setPicked] = useState<File | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    getResumeAnalysis().then((a) => {
-      if (a) {
-        setAnalysis(a);
-        setStage("parsed");
-      }
-    });
+    getResumeAnalysis()
+      .then((a) => {
+        if (a) {
+          setAnalysis(a);
+          setStage("parsed");
+        }
+      })
+      .catch(() => {
+        // 首次进入尚无简历：静默保持上传态
+      });
   }, []);
 
   const stepIndex = stage === "upload" ? 0 : stage === "parsing" ? 1 : stage === "parsed" ? 1 : 2;
 
-  const handleFile = async (name: string) => {
+  const handleFile = async (file: File) => {
+    setPicked(file);
+    setError("");
+    setProgress(null);
     setStage("parsing");
-    const result = await uploadAndParseResume(name);
-    setAnalysis(result);
-    setStage("parsed");
+    try {
+      const result = await uploadAndParseResume(file);
+      setAnalysis(result);
+      setStage("parsed");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "简历解析失败，请重试");
+      setStage(analysis ? "parsed" : "upload");
+    }
   };
 
   const startGenerate = async () => {
+    // 题量用 AI 解析预估出的真实值（40 / 80 / 120 三档），而非固定小批量
+    const total = analysis?.estimatedCount ?? FALLBACK_COUNT;
     setStage("generating");
-    setProgress({ generated: 0, total: 80, currentDimension: "技能八股", done: false });
-    for await (const p of streamGenerate(80)) {
-      setProgress(p);
+    setError("");
+    setProgress({ generated: 0, total, currentDimension: "技能八股", done: false });
+    try {
+      const taskId = await startGenerateTask(total);
+      let last: GenerateProgress | null = null;
+      for await (const p of streamGenerate(taskId)) {
+        last = p;
+        setProgress(p);
+      }
+      if (last?.error) {
+        setError(last.error);
+        setStage("parsed");
+        return;
+      }
+      setStage("done");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "出题失败，请重试");
+      setStage("parsed");
     }
-    setStage("done");
   };
+
+  const doneCount = progress?.generated ?? 0;
+  const totalCount = progress?.total ?? analysis?.estimatedCount ?? FALLBACK_COUNT;
 
   return (
     <div>
@@ -97,7 +138,7 @@ export default function ResumePage() {
               e.preventDefault();
               setDragOver(false);
               const f = e.dataTransfer.files?.[0];
-              if (f) handleFile(f.name);
+              if (f) handleFile(f);
             }}
           >
             <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="#9AA0AB" strokeWidth="1.5">
@@ -109,15 +150,16 @@ export default function ResumePage() {
             >
               点击或拖拽上传简历
             </button>
-            <p className="mt-1 text-xs text-muted">支持 PDF / Word · 最大 10MB</p>
+            <p className="mt-1 text-xs text-muted">支持 PDF / Word / TXT · 最大 10MB · 需可复制文字的版本</p>
             <input
               ref={fileInput}
               type="file"
-              accept=".pdf,.doc,.docx"
+              accept=".pdf,.doc,.docx,.txt,.md"
               className="hidden"
               onChange={(e) => {
                 const f = e.target.files?.[0];
-                if (f) handleFile(f.name);
+                if (f) handleFile(f);
+                e.target.value = ""; // 允许重复选同一个文件重新解析
               }}
             />
           </div>
@@ -125,7 +167,7 @@ export default function ResumePage() {
           {stage === "parsing" && (
             <p className="mt-4 flex items-center gap-2 text-sm text-brand">
               <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-brand border-t-transparent" />
-              AI 正在解析简历…
+              AI 正在解析简历（真实调用主模型，约 10~30 秒）…
             </p>
           )}
           {analysis && stage !== "parsing" && (
@@ -140,14 +182,17 @@ export default function ResumePage() {
               <span className="tag bg-green-50 text-success">状态：已解析</span>
             </div>
           )}
+          {error && (
+            <p className="mt-3 rounded-btn bg-red-50 px-3 py-2 text-xs text-danger">{error}</p>
+          )}
         </section>
 
         {/* AI 解析结果 */}
         <section className="card p-6">
           <div className="mb-4 flex items-center justify-between">
             <h2 className="text-base font-semibold">AI 解析结果</h2>
-            {analysis && (
-              <button className="btn-secondary !px-3 !py-1 text-xs" onClick={() => handleFile(analysis.fileName)}>
+            {picked && (
+              <button className="btn-secondary !px-3 !py-1 text-xs" onClick={() => handleFile(picked)}>
                 重新解析
               </button>
             )}
@@ -156,20 +201,20 @@ export default function ResumePage() {
           {!analysis ? (
             <div className="flex h-52 flex-col items-center justify-center text-sm text-muted">
               <p>上传简历后，这里将展示解析结果</p>
-              <button className="mt-3 text-brand" onClick={() => handleFile("林晓-产品经理-简历.pdf")}>
-                先用示例简历体验 →
-              </button>
+              <p className="mt-2 text-xs">解析与出题均真实调用你配置的主模型，不再使用种子数据</p>
             </div>
           ) : (
             <>
               <div className="grid grid-cols-3 gap-3">
                 <div className="rounded-btn bg-bg p-3 text-center">
                   <p className="text-xs text-muted">工作年限</p>
-                  <p className="mt-1 text-lg font-semibold">{analysis.years} 年</p>
+                  <p className="mt-1 text-lg font-semibold">
+                    {analysis.years > 0 ? `${analysis.years} 年` : "应届"}
+                  </p>
                 </div>
                 <div className="rounded-btn bg-bg p-3 text-center">
                   <p className="text-xs text-muted">目标岗位</p>
-                  <p className="mt-1 text-lg font-semibold">{analysis.targetRole}</p>
+                  <p className="mt-1 text-base font-semibold">{analysis.targetRole}</p>
                 </div>
                 <div className="rounded-btn bg-bg p-3 text-center">
                   <p className="text-xs text-muted">预计生成题量</p>
@@ -201,14 +246,16 @@ export default function ResumePage() {
             <div className="mb-2 flex items-center justify-between text-sm">
               <span className="font-medium">
                 {stage === "done"
-                  ? "专属题库已生成 80 题"
-                  : `已生成 ${progress?.generated ?? 0}/${progress?.total ?? 80} 题 · 当前维度：${progress?.currentDimension}`}
+                  ? `专属题库已生成 ${doneCount} 题`
+                  : `已生成 ${doneCount}/${totalCount} 题 · 当前维度：${progress?.currentDimension}`}
               </span>
-              <span className="text-muted">{Math.round(((progress?.generated ?? 0) / (progress?.total ?? 80)) * 100)}%</span>
+              <span className="text-muted">{Math.round((doneCount / totalCount) * 100)}%</span>
             </div>
-            <ProgressBar value={progress?.generated ?? 0} max={progress?.total ?? 80} color={stage === "done" ? "bg-success" : "bg-brand"} />
+            <ProgressBar value={doneCount} max={totalCount} color={stage === "done" ? "bg-success" : "bg-brand"} />
             <p className="mt-2 text-xs text-muted">
-              {stage === "done" ? "已生成的题立即可刷，题库中心已同步更新" : "已生成的题立即可刷，可随时离开，后台会继续生成"}
+              {stage === "done"
+                ? `已生成的题立即可刷，题库中心已同步更新${progress?.dropped ? `（另有 ${progress.dropped} 题未通过校验/去重被淘汰）` : ""}`
+                : "后台正在调用主模型出题，可随时离开，服务端会继续生成"}
             </p>
             {stage === "done" && (
               <button className="btn-primary mt-4" onClick={() => router.push("/bank")}>
@@ -218,7 +265,10 @@ export default function ResumePage() {
           </div>
         ) : (
           <div className="flex items-center justify-between">
-            <p className="text-sm text-muted">覆盖 L1 基础 → L3 深度 · 每题附参考回答 + 解析 · 贴合真实面试场景</p>
+            <p className="text-sm text-muted">
+              覆盖 L1 基础 → L3 深度 · 每题附参考回答 + 解析 · 按 AI 预估生成
+              约 {analysis?.estimatedCount ?? FALLBACK_COUNT} 题（真实调用主模型，预计 3~10 分钟）
+            </p>
             <button className="btn-primary" disabled={!analysis} onClick={startGenerate}>
               生成专属题库
             </button>

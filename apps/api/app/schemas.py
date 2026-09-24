@@ -205,10 +205,6 @@ class ResumeAnalysis(BaseModel):
     dimensions: list["DimensionScore"]
 
 
-class ResumeUploadRequest(BaseModel):
-    fileName: str = Field(min_length=1, max_length=200)
-
-
 class DimensionScore(BaseModel):
     label: str
     score: int
@@ -229,6 +225,9 @@ class GenerateProgress(BaseModel):
     total: int
     currentDimension: str
     done: bool
+    dropped: int = 0            # 被校验/去重淘汰的题量
+    error: Optional[str] = None  # 非空表示任务失败（部分或全部批次）
+    setId: Optional[str] = None  # 本次生成落库的题集，完成后前端可直接跳转
 
 
 # ---------- 管理端：模型配置（文档 4.6.1） ----------

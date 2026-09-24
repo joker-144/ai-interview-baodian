@@ -1,15 +1,28 @@
 """内存数据仓库：种子数据与前端 apps/web/lib/mock-data.ts 保持一致。
 
-多 worker 部署时需替换为真实存储（PostgreSQL，见 models.py）；
-本模块接口设计已按「用户维度状态 + 全局题库」拆分，便于平移。
+题库（题集 + 题目）在有 MySQL 时优先落库（app/db.py）：
+启动时库内已有题集则以库为准；写入走「内存 + MySQL」尽力而为双写。
+其余用户维度状态仍为内存态，接 PG/Redis 随二期。
 """
 
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from threading import Lock
 from typing import Any
 from uuid import uuid4
 
-from app import llm_config_file
+from app import db, llm_config_file
+
+
+def now_str() -> str:
+    """题库展示时间口径：真实时间 YYYY-MM-DD HH:MM。"""
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
+def _seed_time(hours_ago: float) -> str:
+    """种子题集的更新时间：以启动时刻为基准回推，保证展示的是真实时刻。"""
+    return (datetime.now() - timedelta(hours=hours_ago)).strftime("%Y-%m-%d %H:%M")
+
 
 # ---------------- 常量 ----------------
 
@@ -68,15 +81,15 @@ WEEK_BARS = [
 WEEK_STATS = {"answered": 128, "correctRate": 76, "pendingReview": 23}
 
 SETS_SEED = [
-    {"id": "set-1", "source": "resume", "title": "产品经理核心题集", "questionCount": 6, "updatedAt": "更新于 2 小时前"},
-    {"id": "set-2", "source": "jd_target", "title": "字节跳动 · 后端开发", "questionCount": 6, "updatedAt": "更新于昨天"},
-    {"id": "set-3", "source": "job_search", "title": "数据分析师高频题", "questionCount": 4, "updatedAt": "更新于 3 天前"},
-    {"id": "set-4", "source": "resume", "title": "前端工程师全攻略", "questionCount": 3, "updatedAt": "更新于 3 天前"},
-    {"id": "set-5", "source": "mock_interview", "title": "行为面 STAR 专场", "questionCount": 3, "updatedAt": "更新于上周"},
-    {"id": "set-6", "source": "jd_target", "title": "腾讯 · 产品经理校招", "questionCount": 3, "updatedAt": "更新于上周"},
-    {"id": "set-7", "source": "job_search", "title": "Java 后端进阶", "questionCount": 3, "updatedAt": "更新于 2 周前"},
-    {"id": "set-8", "source": "resume", "title": "运营岗通用题集", "questionCount": 2, "updatedAt": "更新于 2 周前"},
-    {"id": "set-9", "source": "jd_target", "title": "阿里 · 数据产品经理", "questionCount": 2, "updatedAt": "更新于 3 周前"},
+    {"id": "set-1", "source": "resume", "title": "产品经理核心题集", "questionCount": 6, "updatedAt": _seed_time(2)},
+    {"id": "set-2", "source": "jd_target", "title": "字节跳动 · 后端开发", "questionCount": 6, "updatedAt": _seed_time(24)},
+    {"id": "set-3", "source": "job_search", "title": "数据分析师高频题", "questionCount": 4, "updatedAt": _seed_time(72)},
+    {"id": "set-4", "source": "resume", "title": "前端工程师全攻略", "questionCount": 3, "updatedAt": _seed_time(72)},
+    {"id": "set-5", "source": "mock_interview", "title": "行为面 STAR 专场", "questionCount": 3, "updatedAt": _seed_time(168)},
+    {"id": "set-6", "source": "jd_target", "title": "腾讯 · 产品经理校招", "questionCount": 3, "updatedAt": _seed_time(168)},
+    {"id": "set-7", "source": "job_search", "title": "Java 后端进阶", "questionCount": 3, "updatedAt": _seed_time(336)},
+    {"id": "set-8", "source": "resume", "title": "运营岗通用题集", "questionCount": 2, "updatedAt": _seed_time(336)},
+    {"id": "set-9", "source": "jd_target", "title": "阿里 · 数据产品经理", "questionCount": 2, "updatedAt": _seed_time(504)},
 ]
 
 
@@ -425,8 +438,11 @@ class GenerateTask:
     task_id: str
     total: int
     generated: int = 0
+    dropped: int = 0  # 被结构校验 / 答案二次校验 / 去重淘汰的题量（质量口径）
     dimension_index: int = 0
     done: bool = False
+    error: str | None = None  # 失败原因（SSE / 轮询都会回传，前端提示用）
+    set_id: str | None = None  # 本次生成落库的目标题集
     lock: Lock = field(default_factory=Lock)
     # 后台推进协程句柄（防止被 GC；不做持久化）
     asyncio_handle: object | None = None
@@ -443,7 +459,14 @@ class RuntimeState:
     wrong_book: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     # user_id -> list[question_id]
     favorites: dict[str, list[str]] = field(default_factory=dict)
+    # 运行时题库：种子 + 引擎生成（一期内存态，重启回到种子）
+    questions: list[dict[str, Any]] = field(
+        default_factory=lambda: [dict(q) for q in QUESTIONS_SEED]
+    )
     resume_analysis: dict[str, Any] | None = None
+    # 最近一份简历的原文与结构化摘要（供出题提示词使用，不对外回显）
+    resume_text: str = ""
+    resume_summary: str = ""
     generate_tasks: dict[str, GenerateTask] = field(default_factory=dict)
     # layer -> 配置（深拷贝自 LLM_CONFIG_SEED；存在 config/llm.json 时以其覆盖）
     llm_config: dict[str, dict[str, Any]] = field(
@@ -483,9 +506,60 @@ class RuntimeState:
         if isinstance(persisted.get("audit"), list):
             self.audit_log = persisted["audit"]
 
+        # 题库持久化：MySQL 可用且已有题集记录时，以库内数据为准（种子不再生效）
+        bank = db.load_bank()
+        if bank:
+            sets, questions = bank
+            self.sets = sets
+            self.questions = questions
+
 
 state = RuntimeState()
 
 
 def new_id(prefix: str) -> str:
     return f"{prefix}-{uuid4().hex[:12]}"
+
+
+# ---------------- 运行时题库访问 ----------------
+# 所有题目查询统一走这里：种子题与引擎生成的题在同一列表，路由不再直接读 QUESTIONS_SEED
+
+
+def all_questions() -> list[dict[str, Any]]:
+    return state.questions
+
+
+def find_question(question_id: str) -> dict[str, Any] | None:
+    return next((q for q in state.questions if q["id"] == question_id), None)
+
+
+def add_questions(items: list[dict[str, Any]], set_id: str) -> None:
+    """追加题目并同步所属题集的题量与真实更新时间（新建题集时自动补一条）。
+
+    双写：内存 + MySQL（尽力而为，库不可用只记日志不影响主流程）。
+    """
+    state.questions.extend(items)
+    target = next((s for s in state.sets if s["id"] == set_id), None)
+    if target is None:
+        return
+    target["questionCount"] = sum(1 for q in state.questions if q["setId"] == set_id)
+    target["updatedAt"] = now_str()
+    db.save_set(target)
+    db.save_questions(items)
+
+
+def add_set(new_set: dict[str, Any]) -> None:
+    """新建题集：内存置顶 + 写库（题集是题目的外键父表，必须先落）。"""
+    state.sets.insert(0, new_set)
+    db.save_set(new_set)
+
+
+def remove_set(set_id: str) -> bool:
+    """删除题集：连带清掉内存题目并同步删库，返回是否存在。"""
+    before = len(state.sets)
+    state.sets = [s for s in state.sets if s["id"] != set_id]
+    if len(state.sets) == before:
+        return False
+    state.questions = [q for q in state.questions if q["setId"] != set_id]
+    db.delete_set(set_id)
+    return True

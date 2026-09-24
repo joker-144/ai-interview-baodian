@@ -9,4 +9,4 @@ router = APIRouter(prefix="/api/stats", tags=["stats"])
 
 @router.get("/week")
 def week_stats() -> dict:
-    return {"bars": store.WEEK_BARS, "summary": store.WEEK_STATS}
+    return {"bars": store.WEEK_BARS, "stats": store.WEEK_STATS}

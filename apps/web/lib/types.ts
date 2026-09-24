@@ -105,7 +105,7 @@ export interface QuestionSet {
   source: QuestionSource;
   title: string;
   questionCount: number;
-  updatedAt: string; // 展示文案，如「更新于 2 小时前」
+  updatedAt: string; // 真实更新时间（YYYY-MM-DD HH:MM）
 }
 
 export interface Question {
@@ -151,6 +151,12 @@ export interface GenerateProgress {
   total: number;
   currentDimension: string;
   done: boolean;
+  /** 被结构校验 / 答案二次校验 / 去重淘汰的题量 */
+  dropped?: number;
+  /** 非空表示任务失败（部分或全部批次），直接展示给用户 */
+  error?: string | null;
+  /** 本次生成落库的题集 id，完成后可跳转 */
+  setId?: string | null;
 }
 
 /* ---------------- 管理端：模型配置（产品文档 4.6.1） ---------------- */

@@ -9,6 +9,15 @@ pydantic>=2.7
 sentence-transformers>=3.0
 # scripts/download_models.py 下载权重时使用（多源直连 + 断点续传）
 requests>=2.31
+
+# 引擎 A 真实链路：简历文件上传与解析（PDF / DOCX / TXT）
+python-multipart>=0.0.9
+pypdf>=4.2
+python-docx>=1.1
+
+# 题库持久化（本地 MySQL；建库脚本见 sql/schema.sql，连接配置见 config/db.json）
+PyMySQL>=1.1
+
 # 二期起接入（预留）：
 # sqlalchemy>=2.0
 # asyncpg

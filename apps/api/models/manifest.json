@@ -1,0 +1,16 @@
+{
+  "updatedAt": "2026-09-24 11:20:12",
+  "models": [
+    {
+      "modelId": "bge-small-zh-v1.5",
+      "repo": "BAAI/bge-small-zh-v1.5",
+      "kind": "embedding",
+      "label": "BGE 中文向量（小）",
+      "dimensions": 512,
+      "path": "apps/api/models/bge-small-zh-v1.5",
+      "sizeMB": 91.4,
+      "downloadedAt": "2026-09-24 11:20:12",
+      "desc": "默认向量模型：题目去重 / 知识点检索，CPU 可跑"
+    }
+  ]
+}

@@ -1,0 +1,75 @@
+{
+  "_note": "管理端模型配置模板：API Key 一律留空（回显掩码也不写）。真实配置为同目录 llm.json（.gitignore 忽略，不入仓）；本文件入仓，供团队对齐字段结构。启动时 llm.json 缺失会由本模板复制生成。",
+  "configs": {
+    "primary": {
+      "provider": "openai",
+      "modelName": "gpt-4o",
+      "apiKey": "",
+      "baseUrl": "https://api.openai.com/v1",
+      "params": {
+        "temperature": 0.4,
+        "maxTokens": 4096,
+        "timeoutSec": 60,
+        "concurrency": 4
+      },
+      "fallbackModel": "",
+      "enabled": true
+    },
+    "light": {
+      "provider": "openai",
+      "modelName": "gpt-4o-mini",
+      "apiKey": "",
+      "baseUrl": "https://api.openai.com/v1",
+      "params": {
+        "temperature": 0.0,
+        "maxTokens": 1024,
+        "timeoutSec": 30,
+        "concurrency": 8
+      },
+      "fallbackModel": "",
+      "enabled": true
+    },
+    "vision": {
+      "provider": "openai",
+      "modelName": "gpt-4o",
+      "apiKey": "",
+      "baseUrl": "https://api.openai.com/v1",
+      "params": {
+        "temperature": 0.2,
+        "maxTokens": 2048,
+        "timeoutSec": 60,
+        "concurrency": 2
+      },
+      "fallbackModel": "",
+      "enabled": true
+    },
+    "embedding": {
+      "provider": "local",
+      "modelName": "bge-small-zh-v1.5",
+      "apiKey": "",
+      "baseUrl": "",
+      "params": {
+        "dimensions": 512,
+        "timeoutSec": 30,
+        "concurrency": 8
+      },
+      "fallbackModel": "",
+      "enabled": true
+    },
+    "voice": {
+      "provider": "openai",
+      "modelName": "whisper-1",
+      "apiKey": "",
+      "baseUrl": "https://api.openai.com/v1",
+      "params": {
+        "sampleRate": 16000,
+        "ttsVoice": "alloy",
+        "ttsModel": "tts-1"
+      },
+      "fallbackModel": "",
+      "enabled": false
+    }
+  },
+  "history": {},
+  "audit": []
+}

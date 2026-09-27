@@ -14,11 +14,12 @@ import re
 from difflib import SequenceMatcher
 from typing import Any
 
-from app import llm, local_models, store
+from app import db, llm, local_models, store
 
-# 单次调用的题量：深度思考模型输出较长（含 reasoning token），4 题约 2~3k tokens
+# 单次调用的题量：4 题（含解析与参考回答）约 2~3k tokens 输出
 BATCH_SIZE = 4
-MAX_CONCURRENCY = 3
+# 与 llm.json primary.params.concurrency 对齐（run_generation 取两者较小值）
+MAX_CONCURRENCY = 4
 OPTION_COUNT = 4
 # 语义去重阈值（向量已归一化，点积即余弦相似度）
 DEDUP_SIMILARITY = 0.88
@@ -79,8 +80,9 @@ def _opt_key(text: str) -> str:
     return re.sub(r"^\s*[A-Da-d][.、．)）]\s*", "", str(text or "")).strip()
 
 
-def _resume_context() -> str:
-    analysis = store.state.resume_analysis or {}
+def _resume_context(user_id: str) -> str:
+    saved = store.user_resume(user_id) or {}
+    analysis = saved.get("analysis") or {}
     parts = []
     if analysis:
         parts.append(
@@ -88,8 +90,8 @@ def _resume_context() -> str:
             f"折算年限：{analysis.get('years', 0)} 年；"
             f"能力维度：{('、'.join(f'{d['label']}{d['score']}' for d in analysis.get('dimensions', []))) or '未知'}"
         )
-    if store.state.resume_summary:
-        parts.append(f"画像摘要：{store.state.resume_summary}")
+    if saved.get("summary"):
+        parts.append(f"画像摘要：{saved['summary']}")
     if not parts:
         parts.append("暂无简历画像，按通用技术面试题生成。")
     return "\n".join(parts)
@@ -144,13 +146,13 @@ def _normalize(raw: Any, dimension: str) -> dict[str, Any] | None:
     }
 
 
-async def _generate_batch(dimension: str, count: int, avoid: list[str]) -> list[dict[str, Any]]:
+async def _generate_batch(dimension: str, count: int, avoid: list[str], user_id: str) -> list[dict[str, Any]]:
     avoid_hint = ""
     if avoid:
         avoid_hint = "\n\n以下题干已存在，请勿重复或高度相似：\n" + "\n".join(f"- {s[:60]}" for s in avoid[-20:])
 
     user_prompt = (
-        f"候选人画像：\n{_resume_context()}\n\n"
+        f"候选人画像：\n{_resume_context(user_id)}\n\n"
         f"本次请生成 {count} 道题，全部聚焦「{dimension}」这一维度。"
         f"难度分布覆盖 1~3 档，其中至少 1 道为 3 档。{avoid_hint}"
     )
@@ -161,8 +163,10 @@ async def _generate_batch(dimension: str, count: int, avoid: list[str]) -> list[
             {"role": "user", "content": user_prompt},
         ],
         temperature=0.6,
-        # 4 题 + 解析 + 参考回答，且推理模型思考 token 计入输出，预算需留足
+        # 4 题 + 解析 + 参考回答约 2~3k tokens，12288 留足余量
         max_tokens=12288,
+        # 非思考模式：思维链 token 计入输出曾致批次截断，且思考延迟拖慢整体吞吐
+        thinking=False,
     )
     if not isinstance(items, list):
         raise llm.LlmError("出题输出不是 JSON 数组")
@@ -189,6 +193,8 @@ async def _verify(questions: list[dict[str, Any]]) -> list[dict[str, Any]]:
         ],
         temperature=0.0,
         max_tokens=4096,
+        # 复判是轻量结构化任务，同样走非思考模式（提速 + 避免思维链挤占预算）
+        thinking=False,
     )
     if not isinstance(verdicts, list):
         raise llm.LlmError("校验输出不是 JSON 数组")
@@ -276,7 +282,10 @@ def _to_question(item: dict[str, Any], set_id: str) -> dict[str, Any]:
 async def run_generation(task: store.GenerateTask, set_id: str) -> None:
     """后台出题任务：单批失败不丢弃已成功批次，全部结束后置 done。"""
     try:
-        plan = _plan(task.total)
+        # 预备批次：去重/答案复判会淘汰部分产出（实测约 5%~15%），按 25% 余量
+        # 规划批次；满额后剩余批次直接跳过，保证交付量贴近 task.total
+        margin = max(2, task.total // 4)
+        plan = _plan(task.total + margin)
         primary_cfg = store.state.llm_config.get("primary") or {}
         concurrency = max(1, min(int((primary_cfg.get("params") or {}).get("concurrency", 3)), MAX_CONCURRENCY))
         semaphore = asyncio.Semaphore(concurrency)
@@ -284,16 +293,31 @@ async def run_generation(task: store.GenerateTask, set_id: str) -> None:
 
         async def worker(dimension: str, count: int, dimension_index: int) -> None:
             async with semaphore:
-                batch = await _generate_batch(dimension, count, existing_stems)
-                verified = await _verify(batch)
+                with task.lock:
+                    if task.generated >= task.total:
+                        return  # 已满额：预备批次直接跳过，省一次 LLM 调用
+                # 结构化输出偶发不合规范（非数组 / 整批未过校验 / 截断）：
+                # 同参数重试一次即可恢复绝大多数，仍失败才计为批次失败
+                try:
+                    batch = await _generate_batch(dimension, count, existing_stems, task.user_id)
+                except llm.LlmError:
+                    batch = await _generate_batch(dimension, count, existing_stems, task.user_id)
+                try:
+                    verified = await _verify(batch)
+                except llm.LlmError:
+                    verified = await _verify(batch)
                 accepted = await _dedupe(verified, existing_stems)
                 with task.lock:
+                    # 满额裁剪：交付与进度口径始终不超过 task.total
+                    accepted = accepted[: max(task.total - task.generated, 0)]
                     if accepted:
                         store.add_questions([_to_question(item, set_id) for item in accepted], set_id)
                         existing_stems.extend(item["stem"] for item in accepted)
-                    task.generated += len(accepted)
+                        task.generated += len(accepted)
                     task.dropped += len(batch) - len(accepted)
                     task.dimension_index = dimension_index
+                    # 每批同步一次 DB 进度：进程被杀时 generated_cnt 停在最后一批（中断恢复口径）
+                    db.update_generate_progress(task.task_id, task.generated, task.dropped)
 
         results = await asyncio.gather(
             *(worker(dimension, count, index) for index, (dimension, count) in enumerate(plan)),
@@ -309,6 +333,8 @@ async def run_generation(task: store.GenerateTask, set_id: str) -> None:
     finally:
         with task.lock:
             task.done = True
+        # 终态落库（done + error）；恢复任务不会进入本函数，无二次覆盖问题
+        db.finish_generate_task(task.task_id, task.error)
 
 
 def start(task: store.GenerateTask, set_id: str) -> None:

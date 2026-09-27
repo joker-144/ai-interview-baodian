@@ -102,7 +102,7 @@ python scripts\download_models.py     # 默认 bge-small-zh-v1.5，约 91 MB
 mysql -u root -p --default-character-set=utf8mb4 -e "source apps/api/sql/schema.sql"
 ```
 
-脚本会创建 `ai_interview_baodian` 库与 `question_sets` / `questions` 两张表。随后复制连接配置模板并填入你的密码：
+脚本会创建 `ai_interview_baodian` 库，共 7 张表：题库 2 张（`question_sets` / `questions`）+ 用户数据 5 张（`users` / `practice_progress` / `wrong_items` / `favorites` / `resumes`）。随后复制连接配置模板并填入你的密码：
 
 ```powershell
 copy apps\api\config\db.json.example apps\api\config\db.json
@@ -123,7 +123,7 @@ copy apps\api\config\db.json.example apps\api\config\db.json
 ```
 
 > 模板 `db.json.example` 入仓，真实配置 `db.json` 含明文密码、已在 `.gitignore` 中忽略，不会被提交。
-> **降级行为**：不建 `db.json`、`enabled=false`、密码错误或库不存在时，后端只打印一条告警并自动退回内存模式，其余功能不受影响，只是重启后生成数据会丢失。
+> **降级行为**：不建 `db.json`、`enabled=false`、密码错误或库不存在时，后端只打印一条告警并自动退回内存模式，其余功能不受影响，只是重启后题库与用户数据（刷题进度/错题本/收藏/资料）都会回到种子态。
 > 首次启动且库中为空时仍显示演示种子题集；**一旦库中有了题集，就以库内数据为准**（种子不再出现）。
 
 ### 4. 启动后端

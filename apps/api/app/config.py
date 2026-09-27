@@ -24,6 +24,9 @@ class Settings:
     admin_token: str = os.getenv("ADMIN_TOKEN", "admin-dev-token")
     # API Key 存储密钥：一期为 XOR+base64 混淆（非加密），生产需换 KMS / Fernet；密钥不入仓
     key_secret: str = os.getenv("KEY_SECRET", "aib-dev-key-secret-change-me")
+    # C 端 JWT：HS256 签名密钥与有效期（生产必须换强随机值并走环境变量）
+    jwt_secret: str = os.getenv("JWT_SECRET", "aib-dev-jwt-secret-change-me")
+    jwt_expire_days: int = int(os.getenv("JWT_EXPIRE_DAYS", "7"))
     # 本地模型权重目录（离线推理）：由 scripts/download_models.py 下载，权重入仓跟踪
     local_models_dir: str = os.getenv(
         "LOCAL_MODELS_DIR", str(Path(__file__).resolve().parent.parent / "models")

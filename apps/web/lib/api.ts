@@ -8,6 +8,7 @@
  * - 本地只保留：登录态 token、管理端令牌、以及注销前的出题任务计数。
  */
 import type {
+  ActiveGenerateTask,
   AuditEntry,
   DeactivationInfo,
   DeletionResult,
@@ -58,19 +59,29 @@ function write(key: string, value: unknown) {
   window.localStorage.setItem(key, JSON.stringify(value));
 }
 
-/** C 端请求封装：统一错误提示（后端 detail 直出给用户） */
+/** C 端请求封装：自动携带 JWT（Authorization: Bearer），统一错误提示（后端 detail 直出给用户） */
 async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const isForm = typeof FormData !== "undefined" && init?.body instanceof FormData;
+  const auth = read<StoredAuth | null>(LS.auth, null);
+  const authHeaders: Record<string, string> = auth?.token
+    ? { Authorization: `Bearer ${auth.token}` }
+    : {};
   let res: Response;
   try {
     res = await fetch(`${API_BASE}${path}`, {
       ...init,
-      headers: isForm ? undefined : { "Content-Type": "application/json", ...(init?.headers ?? {}) },
+      headers: isForm
+        ? authHeaders
+        : { "Content-Type": "application/json", ...authHeaders, ...(init?.headers ?? {}) },
     });
   } catch {
     throw new Error("无法连接后端服务（apps/api，默认 8000 端口），请确认服务已启动");
   }
   if (!res.ok) {
+    // 会话过期 / 无效：清掉本地登录态，让页面回登录页（登录接口自身的 401 不受影响）
+    if (res.status === 401 && auth) {
+      if (typeof window !== "undefined") window.localStorage.removeItem(LS.auth);
+    }
     let message = `请求失败（HTTP ${res.status}）`;
     try {
       const body = (await res.json()) as { detail?: unknown };
@@ -92,12 +103,36 @@ let generatingCount = 0;
 
 /* ---------------- 账号 ---------------- */
 
+/** 账号密码登录（一期主链路）：后端校验 PBKDF2 哈希并签发 JWT */
+export async function loginByAccount(account: string, password: string): Promise<UserProfile> {
+  const res = await post<{ token: string; user: UserProfile }>("/api/auth/login", { account, password });
+  write(LS.auth, { token: res.token, user: res.user } satisfies StoredAuth);
+  return res.user;
+}
+
+/** 注册并直接登录：后端建号后即签发 token（注册即登录） */
+export async function registerAccount(
+  account: string,
+  password: string,
+  name?: string,
+): Promise<UserProfile> {
+  const res = await post<{ token: string; user: UserProfile }>("/api/auth/register", {
+    account,
+    password,
+    ...(name ? { name } : {}),
+  });
+  write(LS.auth, { token: res.token, user: res.user } satisfies StoredAuth);
+  return res.user;
+}
+
+/** 短信验证码登录（预留，后端返回 501「暂未开通」） */
 export async function loginByPhone(phone: string, code: string): Promise<UserProfile> {
   const res = await post<{ token: string; user: UserProfile }>("/api/auth/phone-login", { phone, code });
   write(LS.auth, { token: res.token, user: res.user } satisfies StoredAuth);
   return res.user;
 }
 
+/** 微信登录（预留，后端返回 501「暂未开通」） */
 export async function loginByWechat(): Promise<UserProfile> {
   const res = await post<{ token: string; user: UserProfile }>("/api/auth/wechat-login");
   write(LS.auth, { token: res.token, user: res.user } satisfies StoredAuth);
@@ -112,10 +147,10 @@ export async function logout(): Promise<void> {
   if (typeof window !== "undefined") window.localStorage.removeItem(LS.auth);
 }
 
-export async function getUser(): Promise<UserProfile> {
+/** 当前登录用户（读本地登录态缓存；未登录返回 null，不请求后端） */
+export async function getUser(): Promise<UserProfile | null> {
   const stored = read<StoredAuth | null>(LS.auth, null);
-  if (stored?.user) return stored.user;
-  return apiFetch<UserProfile>("/api/auth/me");
+  return stored?.user ?? null;
 }
 
 /* ---------------- 我的 / 设置（P14，对齐 /api/me*） ---------------- */
@@ -307,41 +342,76 @@ export async function getResumeAnalysis(): Promise<ResumeAnalysis | null> {
   return apiFetch<ResumeAnalysis | null>("/api/resumes/latest");
 }
 
-/** 触发出题任务，返回 task_id（真实调用主模型，进度走 streamGenerate） */
-export async function startGenerate(count: number): Promise<string> {
+/** 触发出题任务，返回 task_id（真实调用主模型，进度走 streamGenerate）。
+ *  setId：续作场景（中断恢复「继续补齐」）向已有题集追加生成。 */
+export async function startGenerate(count: number, setId?: string): Promise<string> {
   const res = await post<{ taskId: string }>("/api/question-sets/generate", {
     source: "resume",
-    settings: { count },
+    settings: { count, ...(setId ? { setId } : {}) },
   });
   return res.taskId;
 }
+
+/** 当前用户最近的未完成出题任务（无活跃任务时 taskId 为 null）。
+ *  进入生成页先查这里：running → 恢复进度条订阅；interrupted → 提示继续补齐。 */
+export async function getActiveGenerateTask(): Promise<ActiveGenerateTask> {
+  return apiFetch<ActiveGenerateTask>("/api/question-sets/generate/active");
+}
+
+/** SSE 断线重连上限与间隔：覆盖网络抖动与后端重启窗口（30 次 × 2s） */
+const SSE_MAX_RETRIES = 30;
+const SSE_RETRY_DELAY_MS = 2000;
 
 /**
  * 订阅出题进度（对齐 GET /api/question-sets/{task_id}/stream）。
  *
  * 用 fetch + ReadableStream 解析 SSE（EventSource 不支持 GET 之外的定制且无法关闭重连），
- * 客户端断开不影响后端生成，可用 getGenerateProgress 轮询兜底。
+ * 客户端断开不影响后端生成。断线自动重连：先轮询一次终态（后端重启时任务已转中断态），
+ * 未结束则重新订阅 SSE，直到收到 done 事件或任务结束。
  */
 export async function* streamGenerate(taskId: string): AsyncGenerator<GenerateProgress> {
   generatingCount += 1;
   try {
-    const res = await fetch(`${API_BASE}/api/question-sets/${taskId}/stream`);
-    if (!res.ok || !res.body) throw new Error(`订阅出题进度失败（HTTP ${res.status}）`);
+    const auth = read<StoredAuth | null>(LS.auth, null);
+    const headers: Record<string, string> = auth?.token
+      ? { Authorization: `Bearer ${auth.token}` }
+      : {};
+    for (let retries = 0; ; ) {
+      try {
+        const res = await fetch(`${API_BASE}/api/question-sets/${taskId}/stream`, { headers });
+        if (!res.ok || !res.body) throw new Error(`订阅出题进度失败（HTTP ${res.status}）`);
 
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const chunks = buffer.split("\n\n");
-      buffer = chunks.pop() ?? "";
-      for (const chunk of chunks) {
-        if (chunk.startsWith("event: done")) return;
-        const line = chunk.split("\n").find((l) => l.startsWith("data: "));
-        if (!line) continue;
-        yield JSON.parse(line.slice(6)) as GenerateProgress;
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break; // 流关闭：正常结束已通过 done 事件 return，否则视为断线
+          buffer += decoder.decode(value, { stream: true });
+          const chunks = buffer.split("\n\n");
+          buffer = chunks.pop() ?? "";
+          for (const chunk of chunks) {
+            if (chunk.startsWith("event: done")) return;
+            const line = chunk.split("\n").find((l) => l.startsWith("data: "));
+            if (!line) continue;
+            yield JSON.parse(line.slice(6)) as GenerateProgress;
+          }
+        }
+        throw new Error("SSE 连接中断"); // EOF 且未收到 done 事件 → 走重连
+      } catch (err) {
+        if (retries >= SSE_MAX_RETRIES) throw err;
+        retries += 1;
+        await new Promise((r) => setTimeout(r, SSE_RETRY_DELAY_MS));
+        // 重连前先轮询一次：任务已结束（含后端重启后的中断态）则直接透出终态
+        try {
+          const p = await getGenerateProgress(taskId);
+          if (p.done) {
+            yield p;
+            return;
+          }
+        } catch {
+          // 轮询也失败（后端仍在重启窗口）：继续下一轮重连
+        }
       }
     }
   } finally {

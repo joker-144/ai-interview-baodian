@@ -11,10 +11,11 @@
 import asyncio
 import json
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 
-from app import generation, store
+from app import db, generation, store
+from app.auth import get_current_user
 from app.schemas import (
     GenerateRequest,
     GenerateTaskOut,
@@ -22,8 +23,6 @@ from app.schemas import (
     QuestionSet,
     SetCreateRequest,
 )
-
-USER_ID = store.USER_ID
 
 # 题量三档口径（文档 6.x：精简 40 / 标准 80 / 深度 120，默认 80）
 COUNT_LIMITS = {"lite": 40, "standard": 80, "deep": 120}
@@ -59,7 +58,7 @@ def create_set(body: SetCreateRequest) -> dict:
 # 注意：/generate 必须注册在 /{set_id} 之前，否则会被路径参数吞掉
 
 
-def _resolve_total(req: GenerateRequest) -> int:
+def _resolve_total(req: GenerateRequest, user_id: str) -> int:
     """按生成设置解析题量：显式 count 优先，简历通道回退到解析预估。"""
     settings = req.settings or {}
     count = settings.get("count")
@@ -68,14 +67,14 @@ def _resolve_total(req: GenerateRequest) -> int:
     if isinstance(count, int) and count > 0:
         return min(count, MAX_COUNT)
 
-    analysis = store.state.resume_analysis
+    analysis = (store.user_resume(user_id) or {}).get("analysis")
     if req.source == "resume" and analysis:
         estimated = int(analysis.get("estimatedCount") or DEFAULT_COUNT)
         return min(estimated, MAX_COUNT)
     return DEFAULT_COUNT
 
 
-def _resolve_set(req: GenerateRequest) -> dict:
+def _resolve_set(req: GenerateRequest, user_id: str) -> dict:
     """确定本次生成的目标题集：显式 setId > 同岗位已有题集 > 新建。"""
     settings = req.settings or {}
     set_id = settings.get("setId")
@@ -85,7 +84,7 @@ def _resolve_set(req: GenerateRequest) -> dict:
             raise HTTPException(status_code=404, detail="目标题集不存在")
         return target
 
-    analysis = store.state.resume_analysis or {}
+    analysis = (store.user_resume(user_id) or {}).get("analysis") or {}
     role = str(analysis.get("targetRole") or "通用岗位")
     title = f"{role} · {'简历专属题集' if req.source == 'resume' else '专属题集'}"
     existed = next(
@@ -106,18 +105,42 @@ def _resolve_set(req: GenerateRequest) -> dict:
 
 
 @router.post("/generate", response_model=GenerateTaskOut)
-async def start_generate(body: GenerateRequest | None = None) -> GenerateTaskOut:
+async def start_generate(
+    body: GenerateRequest | None = None, user_id: str = Depends(get_current_user)
+) -> GenerateTaskOut:
     """触发出题（题量 = AI 解析预估，40/80/120 档，预计 3~10 分钟），返回 task_id。
 
     进度走 SSE `/{task_id}/stream` 或轮询 `/{task_id}/progress`。
     """
     req = body or GenerateRequest()
-    total = _resolve_total(req)
-    target_set = _resolve_set(req)
-    task = store.GenerateTask(task_id=store.new_id("gen"), total=total)
+    total = _resolve_total(req, user_id)
+    target_set = _resolve_set(req, user_id)
+    # 新任务发起即取代该用户此前的中断记录（active 查询不再返回旧中断横幅）
+    if any(t.user_id == user_id and t.interrupted for t in store.state.generate_tasks.values()):
+        for old in store.state.generate_tasks.values():
+            if old.user_id == user_id and old.interrupted:
+                old.interrupted = False
+        db.dismiss_interrupted_tasks(user_id)  # 持久化取代，重启后不再复活
+    task = store.GenerateTask(task_id=store.new_id("gen"), total=total, user_id=user_id)
     store.state.generate_tasks[task.task_id] = task
+    db.create_generate_task(task.task_id, user_id, target_set["id"], total)  # 中断恢复锚点
     generation.start(task, target_set["id"])
     return GenerateTaskOut(taskId=task.task_id)
+
+
+@router.get("/generate/active")
+def active_generate(user_id: str = Depends(get_current_user)) -> dict:
+    """当前用户最近的未完成出题任务（页面刷新 / 断线后恢复进度用）。
+
+    - running：前端重新订阅 SSE `/{task_id}/stream` 即可恢复进度条；
+    - interrupted：服务重启导致的中断，提示「继续补齐剩余题目」
+      （剩余量 = total - generated，带 setId 续作，avoid 已有题干天然去重）；
+    - 无活跃任务：taskId 为 null。
+    """
+    task = store.active_generate_task(user_id)
+    if task is None:
+        return {"taskId": None}
+    return {"taskId": task.task_id, **_progress_of(task)}
 
 
 def _progress_of(task: store.GenerateTask) -> dict:
@@ -125,6 +148,7 @@ def _progress_of(task: store.GenerateTask) -> dict:
         min(task.dimension_index, len(store.GENERATE_DIMENSIONS) - 1)
     ]
     return {
+        "taskId": task.task_id,
         "generated": task.generated,
         "total": task.total,
         "currentDimension": dimension,
@@ -132,6 +156,7 @@ def _progress_of(task: store.GenerateTask) -> dict:
         "dropped": task.dropped,
         "error": task.error,
         "setId": task.set_id,
+        "interrupted": task.interrupted,
     }
 
 
@@ -184,16 +209,17 @@ def get_set(set_id: str) -> dict:
 
 
 @router.delete("/{set_id}")
-def delete_set(set_id: str) -> dict:
-    """删除题集：同步清理该题集的刷题进度与相关错题。"""
+def delete_set(set_id: str, user_id: str = Depends(get_current_user)) -> dict:
+    """删除题集：同步清理该用户在该题集的刷题进度与相关错题。"""
     if not store.remove_set(set_id):
         raise HTTPException(status_code=404, detail="题集不存在")
 
-    store.state.progress.get(USER_ID, {}).pop(set_id, None)
-    if USER_ID in store.state.wrong_book:
-        store.state.wrong_book[USER_ID] = [
-            w for w in store.state.wrong_book[USER_ID] if w["setId"] != set_id
+    store.state.progress.get(user_id, {}).pop(set_id, None)
+    if user_id in store.state.wrong_book:
+        store.state.wrong_book[user_id] = [
+            w for w in store.state.wrong_book[user_id] if w["setId"] != set_id
         ]
+    store.persist_set_deletion(user_id, set_id)
     return {"ok": True}
 
 

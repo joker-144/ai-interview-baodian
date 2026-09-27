@@ -1,7 +1,7 @@
 """简历文件文本抽取（一期支持 PDF / DOCX / TXT，均为纯本地解析、零 API 成本）。
 
-扫描件（图片型 PDF）抽不出文字时，抛 UnsupportedFormat 交给路由层返回可读提示，
-多模态 OCR 属后续版本（vision 分层已在管理端预留）。
+扫描件（图片型 PDF）抽不出文字时抛 `ScannedDocument`，由路由层转交 vision 分层
+做多模态 OCR 兜底（见 app/resume_ocr.py）；OCR 不可用时才降级为可读错误提示。
 """
 
 import io
@@ -11,11 +11,16 @@ import re
 _CJK = r"\u4e00-\u9fff\u3000-\u303f\uff00-\uffef"
 _CJK_GAP_RE = re.compile(rf"(?<=[{_CJK}])\s+(?=[{_CJK}])")
 _BLANK_RE = re.compile(r"\n{3,}")
-_MIN_CHARS = 30  # 少于该长度视为劣质抽取（多为扫描件）
+# 少于该长度视为劣质抽取（多为扫描件）；resume_ocr 的 OCR 结果也按此校验
+MIN_CHARS = 30
 
 
 class UnsupportedFormat(ValueError):
     """文件格式不支持，或内容无法抽出可分析的文字。"""
+
+
+class ScannedDocument(UnsupportedFormat):
+    """PDF 无文本层（扫描件/图片型），可尝试 vision 分层 OCR。"""
 
 
 def _from_pdf(data: bytes) -> str:
@@ -74,8 +79,8 @@ def extract_text(file_name: str, data: bytes) -> str:
         raise UnsupportedFormat(f"文件解析失败：{exc}") from exc
 
     text = clean(raw)
-    if len(text) < _MIN_CHARS:
-        raise UnsupportedFormat(
-            "未从文件中抽取到有效文字，可能是扫描件/图片型 PDF；请上传可复制文字的版本"
-        )
+    if len(text) < MIN_CHARS:
+        if lower.endswith(".pdf"):
+            raise ScannedDocument("未从 PDF 抽取到有效文字，疑似扫描件/图片型 PDF")
+        raise UnsupportedFormat("未从文件中抽取到有效文字，内容过短无法分析")
     return text

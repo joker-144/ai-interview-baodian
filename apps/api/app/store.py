@@ -46,6 +46,9 @@ DELETION_SCOPES = [
     "学习统计与周报数据",
 ]
 
+# 低样本保护：单题真实作答次数不足 100 不展示全站答对率（合规红线第 4 条）
+MIN_SAMPLE = 100
+
 # ---------------- 种子数据 ----------------
 
 USER = {
@@ -437,14 +440,18 @@ LLM_CONFIG_SEED: dict[str, dict[str, Any]] = {
 class GenerateTask:
     task_id: str
     total: int
+    user_id: str = ""  # 发起出题的用户（JWT）；简历上下文按此读取
     generated: int = 0
     dropped: int = 0  # 被结构校验 / 答案二次校验 / 去重淘汰的题量（质量口径）
     dimension_index: int = 0
     done: bool = False
     error: str | None = None  # 失败原因（SSE / 轮询都会回传，前端提示用）
     set_id: str | None = None  # 本次生成落库的目标题集
+    interrupted: bool = False  # 服务重启导致的中断任务（启动恢复置位，前端提示「继续补齐」）
+    created_at: str = field(  # 秒级时间戳：active 任务按此取最新（now_str 分钟级不够分）
+        default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    )
     lock: Lock = field(default_factory=Lock)
-    # 后台推进协程句柄（防止被 GC；不做持久化）
     asyncio_handle: object | None = None
 
 
@@ -463,11 +470,10 @@ class RuntimeState:
     questions: list[dict[str, Any]] = field(
         default_factory=lambda: [dict(q) for q in QUESTIONS_SEED]
     )
-    resume_analysis: dict[str, Any] | None = None
-    # 最近一份简历的原文与结构化摘要（供出题提示词使用，不对外回显）
-    resume_text: str = ""
-    resume_summary: str = ""
     generate_tasks: dict[str, GenerateTask] = field(default_factory=dict)
+    # question_id -> {attempts, correct}：真实作答事件聚合（全站答对率统计源，
+    # 达标 ≥ MIN_SAMPLE 时回写题目 siteCorrectRate；启动时从 answer_events 重建）
+    answer_stats: dict[str, dict[str, int]] = field(default_factory=dict)
     # layer -> 配置（深拷贝自 LLM_CONFIG_SEED；存在 config/llm.json 时以其覆盖）
     llm_config: dict[str, dict[str, Any]] = field(
         default_factory=lambda: {
@@ -478,10 +484,12 @@ class RuntimeState:
     llm_history: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     # 管理端审计日志（Key 只记掩码）
     audit_log: list[dict[str, Any]] = field(default_factory=list)
-    # P14 我的页：资料覆盖项（空 = 用 USER 种子）、偏好设置、注销申请
-    profile: dict[str, Any] = field(default_factory=dict)
-    settings: dict[str, Any] = field(default_factory=lambda: dict(USER_SETTINGS_SEED))
-    deactivation: dict[str, Any] | None = None
+    # 用户维度状态一律按 user_id 分字典（JWT 多用户），每个用户懒加载（见 ensure_user）
+    profiles: dict[str, dict[str, Any]] = field(default_factory=dict)  # USER 种子的覆盖项
+    settings_map: dict[str, dict[str, Any]] = field(default_factory=dict)
+    deactivations: dict[str, dict[str, Any] | None] = field(default_factory=dict)
+    # user_id -> {analysis, text, summary} | None（最近一份简历解析产物）
+    resumes: dict[str, dict[str, Any] | None] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """模型配置 / 历史 / 审计从 config/llm.json 恢复（不存在时由模板复制或走种子）。
@@ -490,21 +498,20 @@ class RuntimeState:
         文件损坏或缺失时 load() 返回 None，保持种子态。
         """
         persisted = llm_config_file.load()
-        if not persisted:
-            return
-        for layer, saved in persisted["configs"].items():
-            seed = self.llm_config.get(layer)
-            if seed is None or not isinstance(saved, dict):
-                continue
-            self.llm_config[layer] = {
-                **seed,
-                **saved,
-                "params": {**seed["params"], **saved.get("params", {})},
-            }
-        if isinstance(persisted.get("history"), dict):
-            self.llm_history = persisted["history"]
-        if isinstance(persisted.get("audit"), list):
-            self.audit_log = persisted["audit"]
+        if persisted:
+            for layer, saved in persisted["configs"].items():
+                seed = self.llm_config.get(layer)
+                if seed is None or not isinstance(saved, dict):
+                    continue
+                self.llm_config[layer] = {
+                    **seed,
+                    **saved,
+                    "params": {**seed["params"], **saved.get("params", {})},
+                }
+            if isinstance(persisted.get("history"), dict):
+                self.llm_history = persisted["history"]
+            if isinstance(persisted.get("audit"), list):
+                self.audit_log = persisted["audit"]
 
         # 题库持久化：MySQL 可用且已有题集记录时，以库内数据为准（种子不再生效）
         bank = db.load_bank()
@@ -512,6 +519,42 @@ class RuntimeState:
             sets, questions = bank
             self.sets = sets
             self.questions = questions
+
+        # 全站答对率：从作答事件明细重建聚合，样本量达标的题以真实口径覆盖展示值
+        for row in db.load_answer_stats():
+            stats = {"attempts": row["attempts"], "correct": row["correct"]}
+            self.answer_stats[row["questionId"]] = stats
+            if stats["attempts"] >= MIN_SAMPLE:
+                question = next(
+                    (q for q in self.questions if q["id"] == row["questionId"]), None
+                )
+                if question:
+                    question["siteCorrectRate"] = round(
+                        stats["correct"] * 100 / stats["attempts"]
+                    )
+
+        # 演示账号种子（demo / demo1234，幂等）：账号体系开箱可用的最低保障，
+        # 库不可用时静默跳过（ensure_user 会用内存模板兜底）
+        from app.auth import hash_password  # 函数内导入，避免 store ←→ auth 循环依赖
+
+        db.seed_demo_account(USER_ID, "demo", hash_password("demo1234"), USER)
+
+        # 出题任务中断恢复：running 行标记为 interrupted 并在内存重建只读记录，
+        # 前端据此提示「继续补齐剩余题目」；目标题集已被删除的任务无恢复意义，跳过
+        for row in db.load_interrupted_generate_tasks():
+            if not any(s["id"] == row["setId"] for s in self.sets):
+                continue
+            self.generate_tasks[row["taskId"]] = GenerateTask(
+                task_id=row["taskId"],
+                total=row["total"],
+                user_id=row["userId"],
+                generated=row["generated"],
+                dropped=row["dropped"],
+                done=True,
+                interrupted=True,
+                error="生成中断：服务重启导致任务未完成，可继续补齐剩余题目",
+                set_id=row["setId"],
+            )
 
 
 state = RuntimeState()
@@ -548,6 +591,39 @@ def add_questions(items: list[dict[str, Any]], set_id: str) -> None:
     db.save_questions(items)
 
 
+def record_answer_event(user_id: str, set_id: str, question: dict[str, Any],
+                        choice: str, correct: bool) -> None:
+    """真实作答事件聚合：每次提交记一次，样本量达标时回写全站答对率。
+
+    内存计数即时生效（题目 siteCorrectRate 当场更新，GET /api/questions 可见）；
+    事件明细与回写尽力而为落库，重启后由 RuntimeState.__post_init__ 重新聚合恢复。
+    低样本保护：attempts < MIN_SAMPLE 时不覆盖展示值（种子题保留演示数据 / 生成题保持 None）。
+    """
+    stats = state.answer_stats.setdefault(question["id"], {"attempts": 0, "correct": 0})
+    stats["attempts"] += 1
+    stats["correct"] += 1 if correct else 0
+    if stats["attempts"] >= MIN_SAMPLE:
+        question["siteCorrectRate"] = round(stats["correct"] * 100 / stats["attempts"])
+        db.update_site_correct_rate(question["id"], question["siteCorrectRate"])
+    db.save_answer_event(user_id, set_id, question["id"], choice, correct)
+
+
+# ---------------- 出题任务访问 ----------------
+
+
+def active_generate_task(user_id: str) -> GenerateTask | None:
+    """当前用户最近的未完成任务：优先「运行中」，其次最近一次「中断」。
+
+    前端进入生成页时先查这里：running → 恢复进度条订阅；interrupted → 提示继续补齐。
+    """
+    candidates = [
+        t
+        for t in state.generate_tasks.values()
+        if t.user_id == user_id and (not t.done or t.interrupted)
+    ]
+    return max(candidates, key=lambda t: t.created_at, default=None)
+
+
 def add_set(new_set: dict[str, Any]) -> None:
     """新建题集：内存置顶 + 写库（题集是题目的外键父表，必须先落）。"""
     state.sets.insert(0, new_set)
@@ -563,3 +639,104 @@ def remove_set(set_id: str) -> bool:
     state.questions = [q for q in state.questions if q["setId"] != set_id]
     db.delete_set(set_id)
     return True
+
+
+# ---------------- 用户维度状态访问（JWT 多用户；懒加载 + 种子兜底） ----------------
+
+
+def ensure_user(user_id: str) -> None:
+    """首次触达该用户时从 MySQL 加载其全部状态；库不可用/行不存在时用模板兜底。
+
+    幂等：已加载过的用户直接返回，请求内重复调用无额外开销。
+    """
+    if user_id in state.profiles:
+        return
+    saved = db.load_user(user_id)
+    if saved:
+        state.profiles[user_id] = saved["profile"]
+        state.settings_map[user_id] = saved["settings"]
+        state.deactivations[user_id] = saved["deactivation"]
+        state.progress[user_id] = saved["progress"]
+        state.wrong_book[user_id] = saved["wrongBook"]
+        state.favorites[user_id] = saved["favorites"]
+        state.resumes[user_id] = {
+            "analysis": saved["resumeAnalysis"],
+            "text": saved["resumeText"],
+            "summary": saved["resumeSummary"],
+        }
+    else:
+        state.profiles[user_id] = {}
+        state.settings_map[user_id] = dict(USER_SETTINGS_SEED)
+        state.deactivations[user_id] = None
+        state.progress[user_id] = {}
+        state.wrong_book[user_id] = []
+        state.favorites[user_id] = []
+        state.resumes[user_id] = None
+
+
+def user_profile(user_id: str) -> dict[str, Any]:
+    """完整资料 = USER 种子被该用户的覆盖项叠加（与 me.py 的合并口径一致）。"""
+    return {**USER, **state.profiles.get(user_id, {})}
+
+
+def user_settings(user_id: str) -> dict[str, Any]:
+    return {**USER_SETTINGS_SEED, **state.settings_map.get(user_id, {})}
+
+
+def user_deactivation(user_id: str) -> dict[str, Any] | None:
+    return state.deactivations.get(user_id)
+
+
+def user_resume(user_id: str) -> dict[str, Any] | None:
+    return state.resumes.get(user_id)
+
+
+# ---------------- 用户数据持久化钩子（路由改内存后调用，尽力而为写 MySQL） ----------------
+
+
+def persist_user(user_id: str) -> None:
+    """资料 / 偏好 / 注销申请变更后整行 upsert（users 表一行全量）。"""
+    db.save_user(user_id, user_profile(user_id), user_settings(user_id),
+                 state.deactivations.get(user_id))
+
+
+def persist_answer(user_id: str, set_id: str, question_id: str, choice: str) -> None:
+    db.save_progress(user_id, set_id, question_id, choice)
+
+
+def persist_progress_reset(user_id: str, set_id: str) -> None:
+    db.delete_progress(user_id, set_id)
+
+
+def persist_favorite(user_id: str, question_id: str, on: bool) -> None:
+    if on:
+        db.save_favorite(user_id, question_id)
+    else:
+        db.delete_favorite(user_id, question_id)
+
+
+def persist_wrong_item(user_id: str, item: dict[str, Any]) -> None:
+    db.save_wrong_item(user_id, item)
+
+
+def persist_set_deletion(user_id: str, set_id: str) -> None:
+    """删除题集时同步清理该用户该题集的作答进度与错题（与内存行为一致）。"""
+    db.delete_progress(user_id, set_id)
+    db.delete_wrong_items(user_id, set_id)
+
+
+def persist_resume(user_id: str) -> None:
+    """简历上传解析后保存产物（原文 / 摘要 / 结构化结果）。"""
+    saved = state.resumes.get(user_id)
+    db.save_resume(
+        user_id,
+        (saved or {}).get("analysis"),
+        (saved or {}).get("text", ""),
+        (saved or {}).get("summary", ""),
+    )
+
+
+def purge_user_data(user_id: str) -> None:
+    """注销执行：物理清理该用户全部数据行，并清空全站题库（与内存清理对齐）。"""
+    db.clear_user_data(user_id)
+    db.clear_bank()

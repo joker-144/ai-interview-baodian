@@ -4,12 +4,13 @@ import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { PageHeader, ProgressBar } from "@/components/ui";
 import {
+  getActiveGenerateTask,
   getResumeAnalysis,
   startGenerate as startGenerateTask,
   streamGenerate,
   uploadAndParseResume,
 } from "@/lib/api";
-import type { GenerateProgress, ResumeAnalysis } from "@/lib/types";
+import type { ActiveGenerateTask, GenerateProgress, ResumeAnalysis } from "@/lib/types";
 
 type Stage = "upload" | "parsing" | "parsed" | "generating" | "done";
 
@@ -26,6 +27,8 @@ export default function ResumePage() {
   const [error, setError] = useState("");
   const [dragOver, setDragOver] = useState(false);
   const [picked, setPicked] = useState<File | null>(null);
+  /** 中断恢复：服务重启导致的未完成任务（提示「继续补齐剩余题目」） */
+  const [interrupted, setInterrupted] = useState<ActiveGenerateTask | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -39,7 +42,56 @@ export default function ResumePage() {
       .catch(() => {
         // 首次进入尚无简历：静默保持上传态
       });
+    // 中断恢复：优先接回进行中的任务（刷新页面 / SSE 断线后进度条照常走）
+    getActiveGenerateTask()
+      .then((t) => {
+        if (!t?.taskId) return;
+        if (t.interrupted) {
+          setInterrupted(t);
+          return;
+        }
+        setStage("generating");
+        setProgress({
+          generated: t.generated ?? 0,
+          total: t.total ?? 0,
+          currentDimension: t.currentDimension ?? "技能八股",
+          done: false,
+        });
+        followTask(t.taskId).catch(() => {});
+      })
+      .catch(() => {
+        // 未登录 / 后端不可用：静默，由各入口自行引导
+      });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  /** 订阅任务直至结束；续作场景用 offset / displayTotal 把进度条接到中断点上 */
+  const followTask = async (taskId: string, offset = 0, displayTotal?: number) => {
+    let last: GenerateProgress | null = null;
+    for await (const p of streamGenerate(taskId)) {
+      last = p;
+      setProgress(
+        displayTotal ? { ...p, generated: p.generated + offset, total: displayTotal } : p,
+      );
+    }
+    if (last?.interrupted) {
+      // 订阅期间后端重启：转为中断恢复态（进度对齐到全量口径）
+      setInterrupted({
+        ...last,
+        generated: last.generated + offset,
+        total: displayTotal ?? last.total,
+        taskId,
+      });
+      setStage("parsed");
+      return;
+    }
+    if (last?.error) {
+      setError(last.error);
+      setStage("parsed");
+      return;
+    }
+    setStage("done");
+  };
 
   const stepIndex = stage === "upload" ? 0 : stage === "parsing" ? 1 : stage === "parsed" ? 1 : 2;
 
@@ -63,22 +115,36 @@ export default function ResumePage() {
     const total = analysis?.estimatedCount ?? FALLBACK_COUNT;
     setStage("generating");
     setError("");
+    setInterrupted(null);
     setProgress({ generated: 0, total, currentDimension: "技能八股", done: false });
     try {
       const taskId = await startGenerateTask(total);
-      let last: GenerateProgress | null = null;
-      for await (const p of streamGenerate(taskId)) {
-        last = p;
-        setProgress(p);
-      }
-      if (last?.error) {
-        setError(last.error);
-        setStage("parsed");
-        return;
-      }
-      setStage("done");
+      await followTask(taskId);
     } catch (err) {
       setError(err instanceof Error ? err.message : "出题失败，请重试");
+      setStage("parsed");
+    }
+  };
+
+  /** 中断恢复：向原题集续作 remaining 题，进度条从断点接着走 */
+  const continueGenerate = async () => {
+    if (!interrupted?.taskId) return;
+    const base = interrupted.generated ?? 0;
+    const fullTotal = interrupted.total ?? 0;
+    const remaining = Math.max(0, fullTotal - base);
+    if (remaining === 0 || !interrupted.setId) {
+      setInterrupted(null);
+      return;
+    }
+    setStage("generating");
+    setError("");
+    setInterrupted(null);
+    setProgress({ generated: base, total: fullTotal, currentDimension: "技能八股", done: false });
+    try {
+      const taskId = await startGenerateTask(remaining, interrupted.setId);
+      await followTask(taskId, base, fullTotal);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "继续生成失败，请重试");
       setStage("parsed");
     }
   };
@@ -264,7 +330,22 @@ export default function ResumePage() {
             )}
           </div>
         ) : (
-          <div className="flex items-center justify-between">
+          <div>
+            {interrupted && (
+              <div className="mb-4 flex items-center justify-between gap-4 rounded-btn bg-brand-light/40 px-4 py-3">
+                <p className="text-sm text-ink">
+                  上次生成中断（服务重启），已生成 <b>{interrupted.generated ?? 0}</b>/
+                  {interrupted.total ?? 0} 题，已生成的题可正常刷，剩余部分可继续补齐
+                </p>
+                <button
+                  className="btn-primary shrink-0 !px-4 !py-1.5 text-sm"
+                  onClick={continueGenerate}
+                >
+                  继续补齐剩余题目
+                </button>
+              </div>
+            )}
+            <div className="flex items-center justify-between">
             <p className="text-sm text-muted">
               覆盖 L1 基础 → L3 深度 · 每题附参考回答 + 解析 · 按 AI 预估生成
               约 {analysis?.estimatedCount ?? FALLBACK_COUNT} 题（真实调用主模型，预计 3~10 分钟）
@@ -272,6 +353,7 @@ export default function ResumePage() {
             <button className="btn-primary" disabled={!analysis} onClick={startGenerate}>
               生成专属题库
             </button>
+            </div>
           </div>
         )}
       </div>

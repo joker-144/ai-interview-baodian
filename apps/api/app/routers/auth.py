@@ -1,33 +1,90 @@
-"""账号体系：手机号验证码 / 微信登录（一期 Mock，签发演示 token）。"""
+"""账号体系：一期 = 账号密码（pbkdf2 + JWT）；短信 / 微信为二期预留接口。
 
-from fastapi import APIRouter
+签发的 token 为 HS256 JWT（sub=user_id，7 天有效），由 app.auth.get_current_user
+在用户维度端点统一校验；登录 / 注册本身不要求已登录。
+"""
 
-from app import store
-from app.schemas import PhoneLoginRequest, TokenResponse, UserProfile
+import re
+
+from fastapi import APIRouter, Depends, HTTPException
+
+from app import db, store
+from app.auth import get_current_user, hash_password, verify_password, create_access_token
+from app.schemas import (
+    PasswordLoginRequest,
+    PhoneLoginRequest,
+    RegisterRequest,
+    TokenResponse,
+    UserProfile,
+)
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
-
-def _token_response() -> TokenResponse:
-    # 真实实现：校验验证码 / 微信 code 换 openid，签发 JWT
-    return TokenResponse(token=f"mock-jwt-{store.new_id('t')}", user=UserProfile(**_user()))
+_ACCOUNT_RE = re.compile(r"^[A-Za-z0-9_@\-\u4e00-\u9fa5]{2,64}$")
 
 
-def _user() -> dict:
-    """资料种子叠加「我的」页修改项（注销后同样生效）。"""
-    return {**store.USER, **store.state.profile}
+def _user_payload(user_id: str) -> UserProfile:
+    """当前资料 = USER 种子被该用户的修改项叠加（注销后同样生效）。"""
+    return UserProfile(**store.user_profile(user_id))
+
+
+def _issue(user_id: str) -> TokenResponse:
+    store.ensure_user(user_id)
+    return TokenResponse(token=create_access_token(user_id), user=_user_payload(user_id))
+
+
+@router.post("/register", response_model=TokenResponse, status_code=201)
+def register(body: RegisterRequest) -> TokenResponse:
+    """注册：账号（用户名/手机号）+ 密码；建号后直接登录（注册即登录）。"""
+    account = body.account.strip()
+    if not _ACCOUNT_RE.match(account):
+        raise HTTPException(status_code=422, detail="账号仅支持中英文、数字、_@-，长度 2~64")
+    if db.get_user_by_account(account):
+        raise HTTPException(status_code=409, detail="该账号已被注册")
+
+    user_id = store.new_id("u")
+    name = (body.name or account).strip()[:8] or account[:8]
+    profile = {
+        "name": name,
+        "avatarText": name[0],
+        "targetRole": "",
+        "years": 0,
+        "streak": 0,
+        "totalAnswered": 0,
+        "correctRate": 0,
+        # 账号本身是手机号时直接作为回显（一期不脱敏存储，展示层已按协议脱敏）
+        "phone": account if re.match(r"^1\d{10}$", account) else "",
+        "wechatBound": False,
+    }
+    db.create_user(user_id, account, hash_password(body.password), profile,
+                   dict(store.USER_SETTINGS_SEED), None)
+    return _issue(user_id)
+
+
+@router.post("/login", response_model=TokenResponse)
+def login(body: PasswordLoginRequest) -> TokenResponse:
+    """账号密码登录：校验 pbkdf2 哈希后签发 JWT。"""
+    record = db.get_user_by_account(body.account.strip())
+    # 账号不存在与密码错误给同一提示，避免账号可被枚举探测
+    if record is None or not record["passwordHash"] or not verify_password(
+        body.password, record["passwordHash"]
+    ):
+        raise HTTPException(status_code=401, detail="账号或密码错误")
+    return _issue(record["userId"])
 
 
 @router.post("/phone-login", response_model=TokenResponse)
 def phone_login(body: PhoneLoginRequest) -> TokenResponse:
-    return _token_response()
+    """预留（二期接短信服务）：签名与参数保持稳定，接通后仅替换实现。"""
+    raise HTTPException(status_code=501, detail="短信验证码登录暂未开通，请使用账号密码登录")
 
 
 @router.post("/wechat-login", response_model=TokenResponse)
 def wechat_login() -> TokenResponse:
-    return _token_response()
+    """预留（二期接微信开放平台 code2session）：同上。"""
+    raise HTTPException(status_code=501, detail="微信登录暂未开通，请使用账号密码登录")
 
 
 @router.get("/me", response_model=UserProfile)
-def me() -> UserProfile:
-    return UserProfile(**_user())
+def me(user_id: str = Depends(get_current_user)) -> UserProfile:
+    return _user_payload(user_id)

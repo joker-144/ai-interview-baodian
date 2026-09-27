@@ -2,39 +2,49 @@
 
 import { useRouter } from "next/navigation";
 import { useState } from "react";
-import { loginByPhone, loginByWechat } from "@/lib/api";
+import { loginByAccount, registerAccount } from "@/lib/api";
+
+type Mode = "login" | "register";
+
+/** 与后端 RegisterRequest 校验对齐：账号 2~64，密码 6~64 */
+const ACCOUNT_RE = /^[A-Za-z0-9_@\-\u4e00-\u9fa5]{2,64}$/;
 
 export default function LoginPage() {
   const router = useRouter();
-  const [phone, setPhone] = useState("");
-  const [code, setCode] = useState("");
-  const [codeSent, setCodeSent] = useState(false);
-  const [countdown, setCountdown] = useState(0);
+  const [mode, setMode] = useState<Mode>("login");
+  const [account, setAccount] = useState("");
+  const [password, setPassword] = useState("");
+  const [name, setName] = useState("");
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
 
-  const sendCode = () => {
-    if (!/^1\d{10}$/.test(phone) || countdown > 0) return;
-    setCodeSent(true);
-    setCountdown(60);
-    const timer = setInterval(() => {
-      setCountdown((c) => {
-        if (c <= 1) clearInterval(timer);
-        return c - 1;
-      });
-    }, 1000);
+  const accountValid = ACCOUNT_RE.test(account);
+  const passwordValid = password.length >= 6 && password.length <= 64;
+  const canSubmit = accountValid && passwordValid && (mode === "login" || name.length <= 32);
+
+  const submit = async () => {
+    if (!canSubmit || loading) return;
+    setLoading(true);
+    setError("");
+    try {
+      if (mode === "login") {
+        await loginByAccount(account.trim(), password);
+      } else {
+        await registerAccount(account.trim(), password, name.trim() || undefined);
+      }
+      router.push("/");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "登录失败，请稍后重试");
+    } finally {
+      setLoading(false);
+    }
   };
 
-  const doLogin = async () => {
-    if (!/^1\d{10}$/.test(phone) || code.length < 4) return;
-    setLoading(true);
-    await loginByPhone(phone, code);
-    router.push("/");
-  };
-
-  const doWechat = async () => {
-    setLoading(true);
-    await loginByWechat();
-    router.push("/");
+  const fillDemo = () => {
+    setMode("login");
+    setAccount("demo");
+    setPassword("demo1234");
+    setError("");
   };
 
   return (
@@ -50,39 +60,72 @@ export default function LoginPage() {
           <p className="mt-1 text-sm text-muted">系统化刷题，高效拿下心仪 Offer</p>
         </div>
 
-        <label className="mb-2 block text-sm text-ink">手机号</label>
-        <input
-          className="input"
-          placeholder="请输入手机号"
-          value={phone}
-          maxLength={11}
-          onChange={(e) => setPhone(e.target.value.replace(/\D/g, ""))}
-        />
-
-        <label className="mb-2 mt-4 block text-sm text-ink">验证码</label>
-        <div className="flex gap-2">
-          <input
-            className="input"
-            placeholder="输入任意 4 位验证码（Mock）"
-            value={code}
-            maxLength={6}
-            onChange={(e) => setCode(e.target.value.replace(/\D/g, ""))}
-          />
-          <button
-            className="btn-secondary shrink-0 whitespace-nowrap"
-            disabled={!/^1\d{10}$/.test(phone) || countdown > 0}
-            onClick={sendCode}
-          >
-            {countdown > 0 ? `${countdown}s` : codeSent ? "重新发送" : "获取验证码"}
-          </button>
+        {/* 登录 / 注册 切换 */}
+        <div className="mb-5 grid grid-cols-2 gap-1 rounded-btn bg-bg p-1 text-sm font-medium">
+          {(["login", "register"] as Mode[]).map((m) => (
+            <button
+              key={m}
+              className={`rounded-[7px] py-2 transition-colors ${
+                mode === m ? "bg-white text-ink shadow-sm" : "text-muted hover:text-ink"
+              }`}
+              onClick={() => {
+                setMode(m);
+                setError("");
+              }}
+            >
+              {m === "login" ? "账号登录" : "注册新账号"}
+            </button>
+          ))}
         </div>
 
+        <label className="mb-2 block text-sm text-ink">账号</label>
+        <input
+          className="input"
+          placeholder="支持字母 / 数字 / 中文 / _ @ -"
+          value={account}
+          maxLength={64}
+          onChange={(e) => setAccount(e.target.value)}
+        />
+
+        <label className="mb-2 mt-4 block text-sm text-ink">密码</label>
+        <input
+          className="input"
+          type="password"
+          placeholder="6~64 位密码"
+          value={password}
+          maxLength={64}
+          onChange={(e) => setPassword(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && submit()}
+        />
+
+        {mode === "register" && (
+          <>
+            <label className="mb-2 mt-4 block text-sm text-ink">昵称（可选）</label>
+            <input
+              className="input"
+              placeholder="展示用昵称，默认取账号"
+              value={name}
+              maxLength={32}
+              onChange={(e) => setName(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && submit()}
+            />
+            <p className="mt-2 text-xs text-muted">注册成功后自动登录</p>
+          </>
+        )}
+
+        {error && (
+          <p className="mt-4 rounded-btn bg-red-50 px-3 py-2 text-sm text-red-600">{error}</p>
+        )}
+
+        <button className="btn-primary mt-6 w-full" disabled={!canSubmit || loading} onClick={submit}>
+          {loading ? "请稍候…" : mode === "login" ? "登录" : "注册并登录"}
+        </button>
+
         <button
-          className="btn-primary mt-6 w-full"
-          disabled={loading || !/^1\d{10}$/.test(phone) || code.length < 4}
-          onClick={doLogin}
+          className="mt-3 w-full text-center text-xs text-muted hover:text-brand"
+          onClick={fillDemo}
         >
-          登录 / 注册
+          体验演示账号：demo / demo1234（点击填充）
         </button>
 
         <div className="my-5 flex items-center gap-3 text-xs text-muted">
@@ -91,12 +134,15 @@ export default function LoginPage() {
           <span className="h-px flex-1 bg-line" />
         </div>
 
-        <button className="btn-secondary w-full" onClick={doWechat} disabled={loading}>
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="#1E9E6A">
-            <path d="M8.7 4C4.9 4 2 6.6 2 9.9c0 1.8 1 3.5 2.5 4.6l-.6 1.9 2.2-1.1c.8.2 1.5.3 2.3.3h.6c-.2-.6-.3-1.2-.3-1.8 0-3.2 3-5.8 6.8-5.8h.4C15.3 5.7 12.3 4 8.7 4zm-2 3a.9.9 0 110 1.8.9.9 0 010-1.8zm4.5 0a.9.9 0 110 1.8.9.9 0 010-1.8zM15.6 9c-3.3 0-6 2.2-6 4.9s2.7 4.9 6 4.9c.7 0 1.3-.1 1.9-.3l1.9 1-.5-1.7c1.6-.9 2.6-2.4 2.6-4 0-2.8-2.7-4.8-5.9-4.8zm-2 2.4a.8.8 0 110 1.5.8.8 0 010-1.5zm4 0a.8.8 0 110 1.5.8.8 0 010-1.5z" />
-          </svg>
-          微信一键登录
-        </button>
+        {/* 短信 / 微信登录：接口已预留（后端 501），一期未开通 */}
+        <div className="grid grid-cols-2 gap-2">
+          <button className="btn-secondary w-full opacity-50" disabled title="暂未开通">
+            手机验证码登录（敬请期待）
+          </button>
+          <button className="btn-secondary w-full opacity-50" disabled title="暂未开通">
+            微信一键登录（敬请期待）
+          </button>
+        </div>
 
         <p className="mt-5 text-center text-xs text-muted">
           登录即代表同意《用户协议》与《隐私政策》· 本产品面向 16+ 求职用户

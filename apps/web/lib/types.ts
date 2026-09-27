@@ -157,7 +157,14 @@ export interface GenerateProgress {
   error?: string | null;
   /** 本次生成落库的题集 id，完成后可跳转 */
   setId?: string | null;
+  /** 任务 id（active 恢复接口 / 进度回传统一携带） */
+  taskId?: string;
+  /** 服务重启导致的中断任务：提示「继续补齐剩余题目」而非报错 */
+  interrupted?: boolean;
 }
+
+/** 当前用户最近的未完成出题任务（GET /api/question-sets/generate/active） */
+export type ActiveGenerateTask = { taskId: string | null } & Partial<GenerateProgress>;
 
 /* ---------------- 管理端：模型配置（产品文档 4.6.1） ---------------- */
 

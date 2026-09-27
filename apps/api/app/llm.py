@@ -80,13 +80,21 @@ def _post(cfg: dict[str, Any], body: dict[str, Any], timeout: int) -> dict[str, 
 
 def chat_sync(
     layer: str,
-    messages: list[dict[str, str]],
+    messages: list[dict[str, Any]],
     *,
     temperature: float | None = None,
     max_tokens: int | None = None,
     timeout: int | None = None,
+    thinking: bool | None = None,
 ) -> str:
-    """同步对话调用，返回 assistant 文本。"""
+    """同步对话调用，返回 assistant 文本。
+
+    messages 按原样透传：content 可为多模态数组（text / image_url 混排），
+    供 vision 分层 OCR 等场景使用（见 app/resume_ocr.py）。
+
+    thinking：DeepSeek 思考模式开关（默认开启）。思维链 token 计入输出与耗时，
+    结构化任务建议显式传 False 关闭（思考模式下 temperature 不生效）。
+    """
     cfg = layer_config(layer)
     params = cfg.get("params") or {}
     body: dict[str, Any] = {
@@ -97,6 +105,8 @@ def chat_sync(
         # 结构化输出场景更看重稳定与吞吐
         "stream": False,
     }
+    if thinking is not None:
+        body["thinking"] = {"type": "enabled" if thinking else "disabled"}
     payload = _post(cfg, body, timeout or int(params.get("timeoutSec", 60)))
     try:
         content = payload["choices"][0]["message"]["content"]
@@ -108,7 +118,7 @@ def chat_sync(
     return content or ""
 
 
-async def chat(layer: str, messages: list[dict[str, str]], **kwargs: Any) -> str:
+async def chat(layer: str, messages: list[dict[str, Any]], **kwargs: Any) -> str:
     """异步对话调用（线程池执行，避免阻塞事件循环）。"""
     return await asyncio.to_thread(chat_sync, layer, messages, **kwargs)
 

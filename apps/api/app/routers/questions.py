@@ -5,9 +5,6 @@ from fastapi import APIRouter, HTTPException, Query
 from app import store
 from app.schemas import Question, SiteStats
 
-# 低样本保护：作答次数不足 100 不展示全站答对率（合规红线第 4 条）
-MIN_SAMPLE = 100
-
 router = APIRouter(prefix="/api/questions", tags=["questions"])
 
 
@@ -32,15 +29,24 @@ def get_question(question_id: str) -> dict:
 def site_stats(question_id: str) -> dict:
     """全站答对率（供题目详情页独立刷新）。
 
-    一期无 answer_events 表：种子题按题目 id 稳定派生样本量，引擎生成的题
-    （siteCorrectRate=None）样本量不足，按低样本保护不展示；接 PostgreSQL 后改为
-    `SELECT count(*), avg(is_correct) FROM answer_events WHERE question_id = ...`。
+    真实口径：answer_events 按题聚合（内存 answer_stats，提交时实时更新），
+    样本量 ≥ MIN_SAMPLE 时返回真实作答数与答对率；未达标时维持演示口径——
+    种子题按题目 id 稳定派生样本量，引擎生成的题（siteCorrectRate=None）
+    按低样本保护不展示。
     """
     question = store.find_question(question_id)
     if question is None:
         raise HTTPException(status_code=404, detail="题目不存在")
 
+    stats = store.state.answer_stats.get(question_id)
+    if stats and stats["attempts"] >= store.MIN_SAMPLE:
+        return {
+            "questionId": question_id,
+            "answeredCount": stats["attempts"],
+            "correctRate": question["siteCorrectRate"],
+        }
+
     rate = question["siteCorrectRate"]
     digest = sum(ord(c) for c in question_id)
-    answered = digest % MIN_SAMPLE if rate is None else MIN_SAMPLE + digest % 900
+    answered = digest % store.MIN_SAMPLE if rate is None else store.MIN_SAMPLE + digest % 900
     return {"questionId": question_id, "answeredCount": answered, "correctRate": rate}

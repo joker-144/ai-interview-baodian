@@ -23,8 +23,23 @@ class UserProfile(BaseModel):
 
 
 class PhoneLoginRequest(BaseModel):
+    """预留（二期接短信）：一期不校验验证码、不走该入口。"""
+
     phone: str = Field(pattern=r"^1\d{10}$")
     code: str = Field(min_length=4, max_length=6)
+
+
+class PasswordLoginRequest(BaseModel):
+    """一期登录方式：账号 + 密码（账号为用户名或手机号）。"""
+
+    account: str = Field(min_length=2, max_length=64)
+    password: str = Field(min_length=6, max_length=64)
+
+
+class RegisterRequest(PasswordLoginRequest):
+    """注册：账号 + 密码；姓名可省略（默认取账号前 8 字）。"""
+
+    name: str = Field(default="", max_length=32)
 
 
 class TokenResponse(BaseModel):

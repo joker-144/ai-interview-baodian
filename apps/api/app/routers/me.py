@@ -9,10 +9,12 @@
 手动触发以验证链路，接 PG 后改为定时任务扫描 `deactivation_cooling_until` 到期项执行。
 """
 
+import json
 import math
+import urllib.parse
 from datetime import datetime, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 
 from app import store
 from app.auth import get_current_user
@@ -73,27 +75,35 @@ def _assert_active(user_id: str) -> None:
 
 
 def _build(user_id: str) -> MeProfile:
-    """资料 = USER 种子被该用户覆盖项叠加；统计卡与计数按实时数据聚合。"""
+    """资料 = USER 种子被该用户覆盖项叠加；统计卡与计数一律按真实作答事件聚合。"""
     merged = store.user_profile(user_id)
     pending = sum(1 for w in _wrong_items(user_id) if not w["mastered"])
-    mastered = store.MASTERED_BASE + sum(1 for w in _wrong_items(user_id) if w["mastered"])
+    mastered = sum(1 for w in _wrong_items(user_id) if w["mastered"])
+    # 累计作答 / 答对率统一走 answer_events 真实聚合（与首页本周统计、学习周报同口径）
+    totals = store.user_answer_totals(user_id)
+    answered = totals["answered"]
+    correct_rate = round(totals["correct"] * 100 / answered) if answered else 0
+    profile = {k: merged[k] for k in (
+        "name", "avatarText", "targetRole", "years",
+        "streak", "totalAnswered", "correctRate", "phone", "wechatBound",
+    )}
+    # 进度字段以真实聚合覆盖种子/存量值，保证资料区与统计卡口径一致
+    profile["totalAnswered"] = answered
+    profile["correctRate"] = correct_rate
     return MeProfile(
-        profile={k: merged[k] for k in (
-            "name", "avatarText", "targetRole", "years",
-            "streak", "totalAnswered", "correctRate", "phone", "wechatBound",
-        )},
+        profile=profile,
         settings=UserSettings(**store.user_settings(user_id)),
         stats={
-            "answered": merged["totalAnswered"],
-            "correctRate": merged["correctRate"],
+            "answered": answered,
+            "correctRate": correct_rate,
             "streak": merged["streak"],
             "pendingReview": pending,
             "mastered": mastered,
         },
         counts={
-            "sets": len(store.state.sets),
+            "sets": len(store.visible_sets(user_id)),
             "favorites": len(store.state.favorites.get(user_id, [])),
-            "questions": len(store.all_questions()),
+            "questions": len(store.visible_questions(user_id)),
         },
         deactivation=_deactivation_info(user_id),
     )
@@ -201,17 +211,23 @@ def execute_deactivation(
 
     st = store.state
     resume = st.resumes.get(user_id)
+    user_plans = st.plans.get(user_id, {})
     deleted = {
         "progress": len(st.progress.pop(user_id, {})),
         "wrongBook": len(st.wrong_book.pop(user_id, [])),
         "favorites": len(st.favorites.pop(user_id, [])),
         "questionSets": len(st.sets),
-        "plans": len(st.plans),
+        "plans": sum(len(day) for day in user_plans.values()),
         # 简历原文件在对象存储，此处对应物理删除（清内存解析产物引用）
         "resume": 1 if resume else 0,
+        # 批 3/4 新增状态：多版本简历行、站内信、每日一练、求职看板
+        "resumeVersions": len(st.resume_versions.pop(user_id, [])),
+        "notifications": len(st.notifications.pop(user_id, [])),
+        "dailyPractices": 1 if st.daily_practices.pop(user_id, None) else 0,
+        "jobPipeline": len(st.job_pipeline.pop(user_id, [])),
     }
     st.sets.clear()
-    st.plans.clear()
+    st.plans.pop(user_id, None)
     st.resumes[user_id] = None
     # 账号标记为已注销：统计归零，资料不再可读
     st.profiles[user_id].update({
@@ -237,4 +253,42 @@ def execute_deactivation(
         executedAt=current["executedAt"],
         deleted=deleted,
         detail=f"已清理 {sum(deleted.values())} 项数据（含简历原文件物理删除），账号不可恢复",
+    )
+
+
+@router.get("/export")
+def export_my_data(user_id: str = Depends(get_current_user)):
+    """数据导出：聚合该用户全部数据为单个 JSON 下载（第五章「导出个人数据副本」）。
+
+    范围：资料 / 偏好 / 注销状态 / 刷题进度 / 错题 / 收藏 / 简历与体检（多版本） /
+    模考 / 学习计划 / 近 90 天作答事件 / 站内信 / 求职看板。学习计划内存态仅保留当日，
+    历史计划以库内数据为准（MySQL 模式下 ensure_user 已拉取当日，跨日历史不在此列）。
+    """
+    store.ensure_user(user_id)
+    payload = {
+        "exportedAt": _fmt(_now()),
+        "profile": store.user_profile(user_id),
+        "settings": store.user_settings(user_id),
+        "deactivation": store.user_deactivation(user_id),
+        "progress": store.state.progress.get(user_id, {}),
+        "wrongBook": store.state.wrong_book.get(user_id, []),
+        "favorites": store.state.favorites.get(user_id, []),
+        "resumes": store.user_resume_versions(user_id),
+        "exams": store.user_exams(user_id),
+        "plans": store.state.plans.get(user_id, {}),
+        "answerEvents": store.user_week_events(user_id, days=90),
+        "notifications": store.user_notifications(user_id),
+        "jobPipeline": store.pipeline_cards(user_id, include_trash=True),
+    }
+    body = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+    file_name = f"个人数据导出-{_now().strftime('%Y%m%d')}.json"
+    quoted = urllib.parse.quote(file_name)
+    return Response(
+        content=body,
+        media_type="application/json",
+        headers={
+            "Content-Disposition": (
+                f"attachment; filename=\"{quoted}\"; filename*=UTF-8''{quoted}"
+            )
+        },
     )

@@ -61,7 +61,7 @@ export const SOURCE_TAG_CLASS: Record<string, string> = {
   mock_interview: "bg-green-50 text-success",
 };
 
-/** 非一期功能占位页 */
+/** 未上线功能占位页（标签展示当前开发期，后续期次功能逐步开放） */
 export function ComingSoon({ title, phase, desc }: { title: string; phase: string; desc: string }) {
   return (
     <div className="flex flex-col items-center justify-center py-28 text-center">
@@ -72,7 +72,7 @@ export function ComingSoon({ title, phase, desc }: { title: string; phase: strin
       </div>
       <h1 className="mt-6 text-2xl font-semibold">{title}</h1>
       <p className="mt-2 max-w-md text-sm text-muted">{desc}</p>
-      <span className="tag mt-5 bg-brand-light text-brand">{phase} 上线 · 当前为一期（基础学习闭环）</span>
+      <span className="tag mt-5 bg-brand-light text-brand">{phase} 上线 · 当前为四期（求职看板 + 岗位匹配评分）</span>
     </div>
   );
 }

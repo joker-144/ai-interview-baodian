@@ -2,11 +2,12 @@
 
 题库（题集 + 题目）在有 MySQL 时优先落库（app/db.py）：
 启动时库内已有题集则以库为准；写入走「内存 + MySQL」尽力而为双写。
-其余用户维度状态仍为内存态，接 PG/Redis 随二期。
+用户维度状态（进度 / 错题 / 收藏 / 简历 / 学习计划等）同样按用户隔离并尽力落库。
 """
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from hashlib import sha256
 from threading import Lock
 from typing import Any
 from uuid import uuid4
@@ -27,7 +28,7 @@ def _seed_time(hours_ago: float) -> str:
 # ---------------- 常量 ----------------
 
 REVIEW_STAGE_LABELS = ["今天", "第 2 天", "第 4 天", "第 7 天", "第 15 天"]
-MASTERED_BASE = 156  # 历史累计已掌握底数（演示口径）
+MASTERED_BASE = 0  # 已停用假底数：「已掌握」改为真实错题本聚合（保留常量兼容旧引用）
 
 GENERATE_DIMENSIONS = ["技能八股", "项目深挖", "场景设计", "行为面试", "HR 综合", "压力/陷阱题"]
 
@@ -56,11 +57,21 @@ USER = {
     "avatarText": "林",
     "targetRole": "产品经理",
     "years": 3,
-    "streak": 12,
-    "totalAnswered": 1024,
-    "correctRate": 78,
+    # 进度类字段不再伪造：累计作答 / 答对率由 answer_events 真实聚合，连续打卡由真实打卡驱动
+    "streak": 0,
+    "totalAnswered": 0,
+    "correctRate": 0,
     "phone": "138****6021",  # 脱敏回显，明文不落接口
     "wechatBound": True,
+}
+
+# 种子资料仅作用于演示账号（身份展示用）；进度 / 统计一律由真实作答事件与打卡驱动，不再伪造
+DEMO_USER_ID = "demo-user"
+
+_NEW_USER_BASE = {
+    "name": "", "avatarText": "", "targetRole": "", "years": 0,
+    "streak": 0, "totalAnswered": 0, "correctRate": 0,
+    "phone": "", "wechatBound": False, "lastCheckinDate": "",
 }
 
 # P14 我的页偏好（一期仅复习提醒；通知管理 / 数据导出落二期）
@@ -69,19 +80,9 @@ USER_SETTINGS_SEED = {
     "reviewReminderTime": "20:00",
 }
 
-PLANS_SEED = [
-    {"id": "plan-1", "type": "practice", "title": "产品经理核心题集 · 刷 20 题", "estMinutes": 15, "done": True},
-    {"id": "plan-2", "type": "review", "title": "错题复习 · 艾宾浩斯第 2 天", "estMinutes": 10, "done": True},
-    {"id": "plan-3", "type": "interview", "title": "AI 模拟面试 · 行为面专场 1 场", "estMinutes": 25, "done": True},
-    {"id": "plan-4", "type": "jd_set", "title": "JD 定制题集 · 字节跳动后端岗", "estMinutes": 20, "done": False},
-    {"id": "plan-5", "type": "resume_check", "title": "简历体检 · 查看 AI 优化建议", "estMinutes": 5, "done": False},
-]
-
-WEEK_BARS = [
-    {"day": d, "value": v}
-    for d, v in zip(["一", "二", "三", "四", "五", "六", "日"], [15, 18, 12, 20, 16, 32, 15])
-]
-WEEK_STATS = {"answered": 128, "correctRate": 76, "pendingReview": 23}
+# 周图表 / 周报的作答事件留底（内存模式源；MySQL 模式直查 answer_events，不依赖它）
+# 每次提交 append 一条，只保留最近 5000 条防内存无界增长
+ANSWER_LOG_CAP = 5000
 
 SETS_SEED = [
     {"id": "set-1", "source": "resume", "title": "产品经理核心题集", "questionCount": 6, "updatedAt": _seed_time(2)},
@@ -457,7 +458,10 @@ class GenerateTask:
 
 @dataclass
 class RuntimeState:
-    plans: list[dict[str, Any]] = field(default_factory=lambda: [dict(p) for p in PLANS_SEED])
+    # user_id -> {"YYYY-MM-DD" -> list[PlanTask dict]}：当日惰性生成 / 手动维护（二期）
+    plans: dict[str, dict[str, list[dict[str, Any]]]] = field(default_factory=dict)
+    # 近期作答事件留底（周图表 / 周报的内存模式源；MySQL 模式直查 answer_events）
+    answer_log: list[dict[str, Any]] = field(default_factory=list)
     # 题集（支持新建/删除，种子来自 SETS_SEED）
     sets: list[dict[str, Any]] = field(default_factory=lambda: [dict(s) for s in SETS_SEED])
     # user_id -> {set_id -> {question_id -> choice}}
@@ -490,6 +494,24 @@ class RuntimeState:
     deactivations: dict[str, dict[str, Any] | None] = field(default_factory=dict)
     # user_id -> {analysis, text, summary} | None（最近一份简历解析产物）
     resumes: dict[str, dict[str, Any] | None] = field(default_factory=dict)
+    # user_id -> [简历版本行]：多版本简历（批 3，db.resumes v2 表同构，见 add_resume_version）
+    resume_versions: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    # exam_id -> exam dict：模拟考试（内存态与 MySQL exam_records 同构，见 db._exam_row）
+    exams: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # account -> {userId, passwordHash}：账号内存兜底（MySQL 不可用时注册/登录仍可用）
+    accounts: dict[str, dict[str, str]] = field(default_factory=dict)
+    # user_id -> [通知行]：站内信（内存倒序、最新在前，与 db.notifications 同构，见 add_notification）
+    notifications: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    # 岗位检索缓存（三期）：cache_key -> {keyword, city, payload, expiresAt}（与 db.jobs_cache 同构，内存模式源）
+    jobs_cache: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # JD 详情缓存（三期）：security_id -> payload（与 db.job_details 同构）
+    job_details: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # 考点地图报告缓存（三期）：map_key -> {payload, expiresAt}（与 db.job_maps 同构）
+    job_maps: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # 每日一练（三期）：user_id -> {date, id, questionIds, doneIds}（与 db.daily_practices 同构）
+    daily_practices: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # 求职看板（四期）：user_id -> list[看板卡 dict]（与 db.job_pipeline 同构，内存镜像 + MySQL 双写）
+    job_pipeline: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """模型配置 / 历史 / 审计从 config/llm.json 恢复（不存在时由模板复制或走种子）。
@@ -576,6 +598,35 @@ def find_question(question_id: str) -> dict[str, Any] | None:
     return next((q for q in state.questions if q["id"] == question_id), None)
 
 
+# ---------------- 题库归属隔离（ownerId 空=公共题库/预置种子，非空=私有） ----------------
+
+
+def find_set(set_id: str) -> dict[str, Any] | None:
+    return next((s for s in state.sets if s["id"] == set_id), None)
+
+
+def is_public_set(s: dict[str, Any]) -> bool:
+    """ownerId 为空即公共题库（预置种子），对所有用户可见。"""
+    return not s.get("ownerId")
+
+
+def visible_sets(user_id: str) -> list[dict[str, Any]]:
+    """用户可见题集：公共题库 + 自己生成的私有题集。"""
+    return [s for s in state.sets if is_public_set(s) or s.get("ownerId") == user_id]
+
+
+def can_access_set(set_id: str, user_id: str) -> bool:
+    """题集访问鉴权：不存在 / 他人私有题集均返回 False（不泄露存在性）。"""
+    s = find_set(set_id)
+    return s is not None and (is_public_set(s) or s.get("ownerId") == user_id)
+
+
+def visible_questions(user_id: str) -> list[dict[str, Any]]:
+    """用户可见题目：仅来自其可见题集（每日一练等随机抽题的隔离口径）。"""
+    visible_ids = {s["id"] for s in visible_sets(user_id)}
+    return [q for q in state.questions if q["setId"] in visible_ids]
+
+
 def add_questions(items: list[dict[str, Any]], set_id: str) -> None:
     """追加题目并同步所属题集的题量与真实更新时间（新建题集时自动补一条）。
 
@@ -606,6 +657,14 @@ def record_answer_event(user_id: str, set_id: str, question: dict[str, Any],
         question["siteCorrectRate"] = round(stats["correct"] * 100 / stats["attempts"])
         db.update_site_correct_rate(question["id"], question["siteCorrectRate"])
     db.save_answer_event(user_id, set_id, question["id"], choice, correct)
+    # 周图表 / 周报的内存模式源（MySQL 模式直查 answer_events，这里只作留底）
+    state.answer_log.append({
+        "userId": user_id,
+        "date": datetime.now().strftime("%Y-%m-%d"),
+        "correct": 1 if correct else 0,
+    })
+    if len(state.answer_log) > ANSWER_LOG_CAP:
+        del state.answer_log[: len(state.answer_log) - ANSWER_LOG_CAP]
 
 
 # ---------------- 出题任务访问 ----------------
@@ -664,6 +723,14 @@ def ensure_user(user_id: str) -> None:
             "text": saved["resumeText"],
             "summary": saved["resumeSummary"],
         }
+        state.resume_versions[user_id] = db.load_resumes(user_id)
+        state.notifications[user_id] = db.load_notifications(user_id)
+        # 今日计划懒加载（跨日由 GET /api/plans 按 date 惰性补拉 / 生成）
+        state.plans[user_id] = {
+            datetime.now().strftime("%Y-%m-%d"): db.load_plans(
+                user_id, datetime.now().strftime("%Y-%m-%d")
+            )
+        }
     else:
         state.profiles[user_id] = {}
         state.settings_map[user_id] = dict(USER_SETTINGS_SEED)
@@ -672,11 +739,15 @@ def ensure_user(user_id: str) -> None:
         state.wrong_book[user_id] = []
         state.favorites[user_id] = []
         state.resumes[user_id] = None
+        state.resume_versions[user_id] = []
+        state.notifications[user_id] = []
+        state.plans[user_id] = {}
 
 
 def user_profile(user_id: str) -> dict[str, Any]:
-    """完整资料 = USER 种子被该用户的覆盖项叠加（与 me.py 的合并口径一致）。"""
-    return {**USER, **state.profiles.get(user_id, {})}
+    """完整资料：演示账号叠加种子（林晓）；其余用户零值起步，仅由真实数据/打卡推进。"""
+    base = USER if user_id == DEMO_USER_ID else _NEW_USER_BASE
+    return {**base, **state.profiles.get(user_id, {})}
 
 
 def user_settings(user_id: str) -> dict[str, Any]:
@@ -689,6 +760,160 @@ def user_deactivation(user_id: str) -> dict[str, Any] | None:
 
 def user_resume(user_id: str) -> dict[str, Any] | None:
     return state.resumes.get(user_id)
+
+
+# ---------------- 简历多版本（批 3：resumes v2 表 + 内存列表双写） ----------------
+
+
+def user_resume_versions(user_id: str) -> list[dict[str, Any]]:
+    """该用户全部简历版本（version 降序；analysis 内可能含体检 checkup）。"""
+    return state.resume_versions.get(user_id, [])
+
+
+def get_resume_version(user_id: str, resume_id: str) -> dict[str, Any] | None:
+    for rec in state.resume_versions.get(user_id, []):
+        if rec["resumeId"] == resume_id:
+            return rec
+    return None
+
+
+def add_resume_version(user_id: str, *, file_name: str, text: str, summary: str,
+                       analysis: dict[str, Any] | None,
+                       is_optimized: bool = False) -> dict[str, Any]:
+    """新增一个简历版本：内存列表头部插入 + MySQL 尽力而为写一行。
+
+    同时把最新一份同步进 state.resumes，保持出题链路（generation / plans /
+    question_sets 读 user_resume）兼容。
+    """
+    versions = state.resume_versions.setdefault(user_id, [])
+    next_version = max((int(r.get("version", 0)) for r in versions), default=0) + 1
+    rec = {
+        "resumeId": f"res-{uuid4().hex[:12]}",
+        "userId": user_id,
+        "version": next_version,
+        "isOptimized": is_optimized,
+        "fileName": file_name,
+        "text": text,
+        "summary": summary,
+        "analysis": analysis,
+        "createdAt": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    versions.insert(0, rec)
+    state.resumes[user_id] = {"analysis": analysis, "text": text, "summary": summary}
+    db.save_resume_record(rec)
+    return rec
+
+
+def update_resume_version(user_id: str, resume_id: str,
+                          analysis: dict[str, Any] | None) -> None:
+    """更新版本的结构化结果（体检惰性补算写回；若是最新版同步 state.resumes）。"""
+    rec = get_resume_version(user_id, resume_id)
+    if not rec:
+        return
+    rec["analysis"] = analysis
+    versions = state.resume_versions.get(user_id) or []
+    latest = state.resumes.get(user_id)
+    if versions and versions[0]["resumeId"] == resume_id and latest is not None:
+        state.resumes[user_id] = {**latest, "analysis": analysis}
+    db.save_resume_record(rec)
+
+
+def drop_resume_version(user_id: str, resume_id: str) -> bool:
+    """删除一个简历版本；删的是最新版时把 state.resumes 回退到次新版本。"""
+    versions = state.resume_versions.setdefault(user_id, [])
+    index = next((i for i, r in enumerate(versions) if r["resumeId"] == resume_id), -1)
+    if index < 0:
+        return False
+    versions.pop(index)
+    if index == 0:
+        if versions:
+            head = versions[0]
+            state.resumes[user_id] = {
+                "analysis": head.get("analysis"),
+                "text": head.get("text", ""),
+                "summary": head.get("summary", ""),
+            }
+        else:
+            state.resumes[user_id] = None
+    db.delete_resume(user_id, resume_id)
+    return True
+
+
+# ---------------- 站内通知（批 4：内存列表 + notifications 表尽力而为双写） ----------------
+
+NOTIFICATION_TYPES = ("generate_done", "exam_report", "review_due")
+# 内存态上限：站内信只增不减，超过后裁剪最旧（库内不限，展示层 LIMIT 100）
+NOTIFICATIONS_MAX = 200
+
+
+def user_notifications(user_id: str) -> list[dict[str, Any]]:
+    """该用户站内信（created_at 降序，最新在前）。"""
+    return state.notifications.get(user_id, [])
+
+
+def add_notification(user_id: str, ntype: str, payload: dict[str, Any] | None = None) -> dict:
+    """写一条站内信（内存头部插入 + MySQL 尽力而为写一行）。"""
+    rec = {
+        "id": f"ntf-{uuid4().hex[:12]}",
+        "userId": user_id,
+        "type": ntype,
+        "payload": payload,
+        "read": False,
+        "createdAt": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    items = state.notifications.setdefault(user_id, [])
+    items.insert(0, rec)
+    del items[NOTIFICATIONS_MAX:]
+    db.save_notification(rec)
+    return rec
+
+
+def mark_notification_read(user_id: str, notification_id: str) -> bool:
+    """单条已读；db 行数与内存行任一命中即成功。"""
+    db_hit = db.mark_notification_read(user_id, notification_id)
+    mem_hit = False
+    for rec in state.notifications.get(user_id, []):
+        if rec["id"] == notification_id:
+            rec["read"] = True
+            mem_hit = True
+            break
+    return db_hit or mem_hit
+
+
+def mark_all_notifications_read(user_id: str) -> int:
+    """全部已读；返回内存更新的条数（db 同步尽力而为）。"""
+    db.mark_all_notifications_read(user_id)
+    count = 0
+    for rec in state.notifications.get(user_id, []):
+        if not rec["read"]:
+            rec["read"] = True
+            count += 1
+    return count
+
+
+def find_notification_by_date(user_id: str, ntype: str, day: str) -> dict[str, Any] | None:
+    """查某类型通知当日是否已写过（复习到期汇总去重用，day 形如 2026-01-01）。"""
+    for rec in state.notifications.get(user_id, []):
+        if rec["type"] == ntype and str(rec["createdAt"]).startswith(day):
+            return rec
+    return None
+
+
+# ---------------- 账号内存兜底（MySQL 不可用时的注册/登录） ----------------
+
+
+def save_account(user_id: str, account: str, password_hash: str, profile: dict[str, Any]) -> None:
+    """注册信息写入内存：账号可登录、资料以注册项为底（不叠加种子，避免新用户串资料）。
+
+    MySQL 可用后 db.create_user 仍是主路径，此函数只是让内存模式闭环。
+    """
+    state.accounts[account] = {"userId": user_id, "passwordHash": password_hash}
+    state.profiles[user_id] = dict(profile)
+
+
+def find_account(account: str) -> dict[str, str] | None:
+    """登录查号的内存兜底：db.get_user_by_account 未命中时调用。"""
+    return state.accounts.get(account)
 
 
 # ---------------- 用户数据持久化钩子（路由改内存后调用，尽力而为写 MySQL） ----------------
@@ -719,24 +944,317 @@ def persist_wrong_item(user_id: str, item: dict[str, Any]) -> None:
     db.save_wrong_item(user_id, item)
 
 
+# ---------------- 模拟考试（二期） ----------------
+
+
+EXAM_MAX_QUESTIONS = 40       # 单卷题量上限（客观题抽取）
+EXAM_SEC_PER_QUESTION = 90    # 限时 = 题数 × 90 秒
+EXAM_OBJECTIVE_TYPES = ("single_choice", "multi_choice", "judge")
+
+
+def get_exam(user_id: str, exam_id: str) -> dict[str, Any] | None:
+    """取本人的考试：内存优先，未命中从 MySQL 拉（跨重启恢复 running 场景）。"""
+    exam = state.exams.get(exam_id)
+    if exam is None:
+        exam = db.load_exam(user_id, exam_id)
+        if exam is not None:
+            state.exams[exam_id] = exam
+    if exam is None or exam.get("userId") != user_id:
+        return None
+    return exam
+
+
+def persist_exam(exam: dict[str, Any]) -> None:
+    """考试状态变更后落库（答题/暂停/恢复/交卷都会调，覆盖写全行）。"""
+    db.save_exam_record(exam)
+
+
+def user_exams(user_id: str) -> list[dict[str, Any]]:
+    """历史列表：MySQL 可用直查，内存模式从 state.exams 过滤倒序。"""
+    records = db.load_exams(user_id)
+    if records:
+        return records
+    mine = [e for e in state.exams.values() if e.get("userId") == user_id]
+    mine.sort(key=lambda e: e.get("createdAt", ""), reverse=True)
+    return mine
+
+
+def done_scores_by_role(bucket_role: str) -> list[int]:
+    """同岗位分桶已交卷分数：MySQL 直查优先，内存模式回退聚合。"""
+    scores = db.load_done_scores(bucket_role)
+    if scores:
+        return scores
+    return sorted(
+        e["score"] for e in state.exams.values()
+        if e.get("bucketRole") == bucket_role and e.get("status") == "done"
+        and e.get("score") is not None
+    )
+
+
+# ---------------- 学习计划持久化（二期） ----------------
+
+
+def today_key() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def today_plans(user_id: str) -> list[dict[str, Any]]:
+    return state.plans.setdefault(user_id, {}).setdefault(today_key(), [])
+
+
+def persist_plan(user_id: str, item: dict[str, Any]) -> None:
+    db.save_plan(user_id, today_key(), item)
+
+
+def drop_plan(user_id: str, plan_id: str) -> None:
+    db.delete_plan(user_id, plan_id)
+
+
+def user_week_events(user_id: str, days: int = 7) -> list[dict[str, Any]]:
+    """近 N 天逐日作答聚合：MySQL 可用直查 answer_events，否则用内存 answer_log。"""
+    events = db.load_week_events(user_id, days)
+    if events:
+        return events
+    # 内存模式：按日聚合 answer_log
+    today = datetime.now().date()
+    buckets: dict[str, dict[str, int]] = {}
+    for offset in range(days):
+        day = (today - timedelta(days=offset)).strftime("%Y-%m-%d")
+        buckets[day] = {"date": day, "answered": 0, "correct": 0}
+    for ev in state.answer_log:
+        if ev["userId"] != user_id or ev["date"] not in buckets:
+            continue
+        buckets[ev["date"]]["answered"] += 1
+        buckets[ev["date"]]["correct"] += int(ev["correct"])
+    return sorted(buckets.values(), key=lambda b: b["date"])
+
+
+def user_answer_totals(user_id: str) -> dict[str, int]:
+    """累计作答口径（全部时间）：MySQL 直查 answer_events，否则聚合内存 answer_log。"""
+    totals = db.load_user_answer_totals(user_id)
+    if totals is not None:
+        return totals
+    answered = 0
+    correct = 0
+    for ev in state.answer_log:
+        if ev["userId"] != user_id:
+            continue
+        answered += 1
+        correct += int(ev["correct"])
+    return {"answered": answered, "correct": correct}
+
+
 def persist_set_deletion(user_id: str, set_id: str) -> None:
     """删除题集时同步清理该用户该题集的作答进度与错题（与内存行为一致）。"""
     db.delete_progress(user_id, set_id)
     db.delete_wrong_items(user_id, set_id)
 
 
-def persist_resume(user_id: str) -> None:
-    """简历上传解析后保存产物（原文 / 摘要 / 结构化结果）。"""
-    saved = state.resumes.get(user_id)
-    db.save_resume(
-        user_id,
-        (saved or {}).get("analysis"),
-        (saved or {}).get("text", ""),
-        (saved or {}).get("summary", ""),
-    )
-
-
 def purge_user_data(user_id: str) -> None:
     """注销执行：物理清理该用户全部数据行，并清空全站题库（与内存清理对齐）。"""
     db.clear_user_data(user_id)
     db.clear_bank()
+
+
+# ---------------- 岗位检索缓存（三期，内存镜像 + MySQL 双写，TTL 见下） ----------------
+
+# 检索列表 TTL 收紧到 1 天：岗位「是否还在招 / 薪资是否变了」的新鲜度优先，
+# 代价是同一关键词每天首次检索会真实打一次平台（节流与风控口径不变）。
+JOBS_CACHE_TTL_DAYS = 1
+# JD 详情与考点地图保持 7 天：详情为单卡惰性抓取（风控最敏感、JD 文本变动小），
+# 考点地图是本侧生成的报告（过期即消失、需重新生成题库才有，缩短会造成体验倒退）。
+JOB_DETAIL_TTL_DAYS = 7
+JOB_MAP_TTL_DAYS = 7
+
+
+def jobs_cache_key(keyword: str, city: str) -> str:
+    """缓存 key：sha256(关键词|城市) 截断 32 位（与 schema 注释口径一致）。"""
+    return sha256(f"{keyword.strip()}|{city.strip()}".encode("utf-8")).hexdigest()[:32]
+
+
+def _cache_expiry(days: int) -> tuple[datetime, str]:
+    """过期时刻：内存存 datetime，库存 'YYYY-MM-DD HH:MM:SS' 字符串。"""
+    expires = datetime.now() + timedelta(days=days)
+    return expires, expires.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _reload_expiry(days: int) -> datetime:
+    """db 回源条目的内存过期时刻：库行不回传 expires_at，保守取剩余 TTL 的一半（下限 1 小时）。
+
+    下限必不可少：TTL=1 天时 `days // 2` 会算成 0，内存条目写进去就立即过期，
+    导致每次读取都回源打库（内存镜像等于失效）。
+    """
+    return datetime.now() + max(timedelta(days=days) / 2, timedelta(hours=1))
+
+
+def jobs_cache_get(cache_key: str) -> dict[str, Any] | None:
+    """未过期缓存（内存 -> db 回源并回填内存）；过期条目即剔（惰性过期刷新）。"""
+    entry = state.jobs_cache.get(cache_key)
+    if entry:
+        if entry["expiresAt"] > datetime.now():
+            return entry
+        state.jobs_cache.pop(cache_key, None)
+    row = db.load_jobs_cache(cache_key, JOBS_CACHE_TTL_DAYS)
+    if not row:
+        return None
+    # 库行无过期时刻字段回传，统一按剩余 TTL 的中点给内存条目（避免反复回源）
+    loaded = {**row, "expiresAt": _reload_expiry(JOBS_CACHE_TTL_DAYS)}
+    state.jobs_cache[cache_key] = loaded
+    return loaded
+
+
+def jobs_cache_put(keyword: str, city: str, payload: list[dict[str, Any]]) -> str:
+    """写入/覆盖缓存（同 key 重查刷新 TTL），返回 cache_key。"""
+    cache_key = jobs_cache_key(keyword, city)
+    expires, expires_str = _cache_expiry(JOBS_CACHE_TTL_DAYS)
+    entry = {
+        "keyword": keyword.strip(),
+        "city": city.strip(),
+        "payload": payload,
+        "expiresAt": expires,
+    }
+    state.jobs_cache[cache_key] = entry
+    db.save_jobs_cache(cache_key, entry["keyword"], entry["city"], payload, expires_str)
+    return cache_key
+
+
+def job_detail_get(security_id: str) -> dict[str, Any] | None:
+    """未过期 JD 详情（内存 -> db 回源并回填）。"""
+    entry = state.job_details.get(security_id)
+    if entry:
+        if entry["expiresAt"] > datetime.now():
+            return entry["payload"]
+        state.job_details.pop(security_id, None)
+    payload = db.load_job_detail(security_id)
+    if payload is None:
+        return None
+    state.job_details[security_id] = {
+        "payload": payload,
+        "expiresAt": _reload_expiry(JOB_DETAIL_TTL_DAYS),
+    }
+    return payload
+
+
+def job_detail_put(security_id: str, keyword: str, payload: dict[str, Any]) -> None:
+    """JD 详情写入/覆盖。"""
+    expires, expires_str = _cache_expiry(JOB_DETAIL_TTL_DAYS)
+    state.job_details[security_id] = {"payload": payload, "expiresAt": expires}
+    db.save_job_detail(security_id, keyword, payload, expires_str)
+
+
+def job_map_get(map_key: str) -> dict[str, Any] | None:
+    """未过期考点地图报告（内存 -> db 回源并回填）。"""
+    entry = state.job_maps.get(map_key)
+    if entry:
+        if entry["expiresAt"] > datetime.now():
+            return entry["payload"]
+        state.job_maps.pop(map_key, None)
+    payload = db.load_job_map(map_key)
+    if payload is None:
+        return None
+    state.job_maps[map_key] = {
+        "payload": payload,
+        "expiresAt": _reload_expiry(JOB_MAP_TTL_DAYS),
+    }
+    return payload
+
+
+def job_map_put(keyword: str, city: str, payload: dict[str, Any]) -> str:
+    """考点地图报告写入/覆盖，返回 map_key（与检索缓存同 hash 口径）。"""
+    map_key = jobs_cache_key(keyword, city)
+    expires, expires_str = _cache_expiry(JOB_MAP_TTL_DAYS)
+    state.job_maps[map_key] = {"payload": payload, "expiresAt": expires}
+    db.save_job_map(map_key, keyword.strip(), city.strip(), payload, expires_str)
+    return map_key
+
+
+def daily_get(user_id: str, practice_date: str) -> dict[str, Any] | None:
+    """当日每日一练（内存 -> db 回源并回填）；无行返回 None（由调用方惰性生成）。"""
+    entry = state.daily_practices.get(user_id)
+    if entry and entry["date"] == practice_date:
+        return entry
+    row = db.load_daily_practice(user_id, practice_date)
+    if row is None:
+        return None
+    entry = {
+        "id": row["id"],
+        "date": practice_date,
+        "questionIds": row["questionIds"],
+        "doneIds": row["doneIds"],
+    }
+    state.daily_practices[user_id] = entry
+    return entry
+
+
+def daily_put(user_id: str, entry: dict[str, Any]) -> None:
+    """每日一练写入/覆盖（一人一天一行，题目快照当日不变）。"""
+    state.daily_practices[user_id] = entry
+    db.save_daily_practice(
+        entry["id"], user_id, entry["date"], entry["questionIds"], entry["doneIds"]
+    )
+
+
+# ---------------- 求职看板（四期，内存镜像 + MySQL 双写） ----------------
+
+PIPELINE_STAGES = ["applied", "written", "interview", "offer"]
+
+
+def _pipeline_ensure(user_id: str) -> list[dict[str, Any]]:
+    """取该用户看板卡列表（内存未命中时从 db 回源并回填）。
+
+    读库瞬时失败（返回 None）先重试一次再降级：若首次失败就把空列表写进内存，
+    该用户看板会被「清空」到进程重启为止（db 行仍在，但内存不再回源），
+    并连带单岗位专属出题解析不到岗位名 / 挂接不上看板卡。
+    """
+    if user_id in state.job_pipeline:
+        return state.job_pipeline[user_id]
+    rows = db.load_pipeline(user_id)
+    if rows is None:
+        rows = db.load_pipeline(user_id)
+    state.job_pipeline[user_id] = rows if rows is not None else []
+    return state.job_pipeline[user_id]
+
+
+def pipeline_cards(user_id: str, include_trash: bool = False) -> list[dict[str, Any]]:
+    """看板卡列表（默认排除回收站）。"""
+    cards = _pipeline_ensure(user_id)
+    return [c for c in cards if include_trash or not c.get("inTrash")]
+
+
+def pipeline_find(user_id: str, card_id: str) -> dict[str, Any] | None:
+    """按 id 查本人看板卡（含回收站）；不存在/非本人返回 None。"""
+    return next((c for c in _pipeline_ensure(user_id) if c["id"] == card_id), None)
+
+
+def pipeline_add(user_id: str, card: dict[str, Any]) -> dict[str, Any]:
+    """新增看板卡（写内存 + 尽力而为写库）。"""
+    cards = _pipeline_ensure(user_id)
+    card.setdefault("inTrash", False)
+    cards.append(card)
+    db.save_pipeline_card(card)
+    return card
+
+
+def pipeline_save(user_id: str, card: dict[str, Any]) -> None:
+    """看板卡变更后回写（内存已原地改，此处只同步 db）。"""
+    db.save_pipeline_card(card)
+
+
+def pipeline_purge(user_id: str, card_id: str) -> bool:
+    """彻底删除看板卡（从内存移除 + 删库）；命中返回 True。"""
+    cards = _pipeline_ensure(user_id)
+    target = next((c for c in cards if c["id"] == card_id), None)
+    if target is None:
+        return False
+    cards.remove(target)
+    db.delete_pipeline_card(card_id)
+    return True
+
+
+def set_practice_progress(user_id: str, set_id: str) -> dict[str, int]:
+    """题集练习完成度（与题库中心口径一致）：done=已作答题数，total=题集总题数。"""
+    if not set_id:
+        return {"done": 0, "total": 0}
+    total = sum(1 for q in state.questions if q["setId"] == set_id)
+    done = len(state.progress.get(user_id, {}).get(set_id, {}))
+    return {"done": min(done, total), "total": total}

@@ -1,6 +1,7 @@
 "use client";
 
 import { useRouter } from "next/navigation";
+import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 import { PageHeader, ProgressBar } from "@/components/ui";
 import {
@@ -299,6 +300,16 @@ export default function ResumePage() {
                     <span className="w-8 text-right text-sm font-medium">{d.score}</span>
                   </div>
                 ))}
+              </div>
+
+              <div className="mt-5 flex items-center justify-between rounded-btn bg-bg px-4 py-3">
+                <span className="text-xs text-muted">体检报告：总分 · 亮点 · 待改进 · AI 一键优化</span>
+                <Link
+                  href={analysis.resumeId ? `/resume/report?v=${analysis.resumeId}` : "/resume/report"}
+                  className="btn-secondary !px-3 !py-1.5 text-xs"
+                >
+                  查看体检报告
+                </Link>
               </div>
             </>
           )}

@@ -10,9 +10,21 @@
 import type {
   ActiveGenerateTask,
   AuditEntry,
+  BossBrowserStartResult,
   DeactivationInfo,
   DeletionResult,
+  ExamListItem,
+  ExamPaper,
+  ExamReport,
+  ExamState,
   GenerateProgress,
+  DailyPractice,
+  DailyProgressResult,
+  JobCard,
+  JobDetailResult,
+  JobMap,
+  JobSearchResult,
+  JobsStatus,
   LlmConfig,
   LlmConfigUpdate,
   LlmLayer,
@@ -21,13 +33,23 @@ import type {
   LocalModelList,
   MeProfile,
   ModelDiscoverResult,
-  PlanTask,
+  NotificationItem,
+  PlanList,
   ProfileUpdate,
   Question,
   QuestionSet,
+  PipelineAddInput,
+  PipelineBoard,
+  PipelineCard,
+  PipelinePatchInput,
+  RemedialResult,
   ResumeAnalysis,
+  ResumeCheckup,
+  ResumeVersion,
   UserProfile,
   UserSettings,
+  WeekOverview,
+  WeeklyReport,
   WrongItem,
   WrongReason,
 } from "./types";
@@ -191,26 +213,90 @@ export async function executeDeactivation(force = false): Promise<DeletionResult
   return post<DeletionResult>(`/api/me/deactivation/execute?force=${force ? "true" : "false"}`);
 }
 
-/* ---------------- 首页 / 计划 ---------------- */
+/* ---------------- 首页 / 计划 / 周报（二期） ---------------- */
 
-export async function getPlans(): Promise<PlanTask[]> {
-  return apiFetch<PlanTask[]>("/api/plans");
+/** 今日学习计划：当日无计划时后端惰性生成（AI 措辞，失败回落规则） */
+export async function getPlans(): Promise<PlanList> {
+  return apiFetch<PlanList>("/api/plans");
 }
 
-export async function togglePlan(taskId: string): Promise<PlanTask[]> {
-  await post<PlanTask>(`/api/plans/${taskId}/toggle`);
-  return getPlans();
+export async function togglePlan(taskId: string): Promise<PlanList> {
+  return post<PlanList>(`/api/plans/${taskId}/toggle`);
 }
 
-export async function addPlan(title: string): Promise<PlanTask[]> {
-  await apiFetch<PlanTask>("/api/plans", { method: "POST", body: JSON.stringify({ title }) });
-  return getPlans();
+export async function addPlan(title: string): Promise<PlanList> {
+  return post<PlanList>("/api/plans", { title });
 }
 
-export async function getWeekOverview() {
-  return apiFetch<{ bars: { day: string; value: number }[]; stats: { answered: number; correctRate: number; pendingReview: number } }>(
-    "/api/stats/week",
-  );
+export async function deletePlan(taskId: string): Promise<PlanList> {
+  return apiFetch<PlanList>(`/api/plans/${taskId}`, { method: "DELETE" });
+}
+
+/** 本周柱状图 + 三卡（从作答事件真实聚合） */
+export async function getWeekOverview(): Promise<WeekOverview> {
+  return apiFetch<WeekOverview>("/api/stats/week");
+}
+
+/** 学习周报（趋势 / 薄弱知识点 TOP5 / 下周建议） */
+export async function getWeeklyReport(): Promise<WeeklyReport> {
+  return apiFetch<WeeklyReport>("/api/reports/weekly");
+}
+
+/* ---------------- 模拟考试（二期批 2） ---------------- */
+
+/** 组卷：指定题集抽客观题（最多 40 题，限时 = 题数 × 90 秒） */
+export async function createExam(setId: string): Promise<ExamPaper> {
+  return post<ExamPaper>("/api/exams", { setId });
+}
+
+/** 历史列表（含 running，入口据此弹「恢复上次考试」） */
+export async function getExams(): Promise<ExamListItem[]> {
+  return apiFetch<ExamListItem[]>("/api/exams");
+}
+
+/** 考试现场（running/paused 原样返回，断网/刷新恢复基础） */
+export async function getExamState(examId: string): Promise<ExamState> {
+  return apiFetch<ExamState>(`/api/exams/${examId}`);
+}
+
+/** 单题作答：即时落库但不回传对错（考试态无判分回显；PUT 对齐后端路由） */
+export async function answerExam(
+  examId: string,
+  questionId: string,
+  choice: string,
+  timeSec = 0,
+): Promise<{ ok: boolean; answered: number }> {
+  return apiFetch<{ ok: boolean; answered: number }>(`/api/exams/${examId}/answer`, {
+    method: "PUT",
+    body: JSON.stringify({ questionId, choice, timeSec }),
+  });
+}
+
+export async function pauseExam(examId: string): Promise<void> {
+  await post(`/api/exams/${examId}/pause`);
+}
+
+export async function resumeExam(examId: string): Promise<void> {
+  await post(`/api/exams/${examId}/resume`);
+}
+
+export async function abandonExam(examId: string): Promise<void> {
+  await post(`/api/exams/${examId}/abandon`);
+}
+
+/** 交卷判分（「只交已答」口径由前端确认层保证） */
+export async function submitExam(examId: string): Promise<{ score: number }> {
+  return post<{ score: number }>(`/api/exams/${examId}/submit`);
+}
+
+/** 模考报告：分数 / 维度分 / 分桶百分位 / 薄弱点 / 历史趋势 */
+export async function getExamReport(examId: string): Promise<ExamReport> {
+  return apiFetch<ExamReport>(`/api/exams/${examId}/report`);
+}
+
+/** 一键补强：按薄弱点从题库抽同标签题生成补强卷题集 */
+export async function remedialExam(examId: string): Promise<RemedialResult> {
+  return post<RemedialResult>(`/api/exams/${examId}/remedial`);
 }
 
 /* ---------------- 题库中心 ---------------- */
@@ -340,6 +426,109 @@ export async function uploadAndParseResume(file: File): Promise<ResumeAnalysis> 
 
 export async function getResumeAnalysis(): Promise<ResumeAnalysis | null> {
   return apiFetch<ResumeAnalysis | null>("/api/resumes/latest");
+}
+
+// ---------------- 简历多版本 / 体检 / AI 优化（批 3） ----------------
+
+/** 多版本简历列表（version 降序；analysis 内含体检报告，旧记录可能缺） */
+export async function getResumes(): Promise<ResumeVersion[]> {
+  return apiFetch<ResumeVersion[]>("/api/resumes");
+}
+
+/** 体检报告；旧记录缺 checkup 时后端惰性补算并写回 */
+export async function getResumeCheckup(resumeId: string): Promise<ResumeCheckup> {
+  const res = await apiFetch<{ checkup: ResumeCheckup }>(
+    `/api/resumes/${resumeId}/checkup`,
+  );
+  return res.checkup;
+}
+
+/** AI 一键优化：按体检结论主模型重写，返回优化版新版本（version+1） */
+export async function optimizeResume(resumeId: string): Promise<ResumeAnalysis> {
+  return post<ResumeAnalysis>(`/api/resumes/${resumeId}/optimize`);
+}
+
+/** 删除一个简历版本（最新版被删时后端自动回退到次新版） */
+export async function deleteResume(resumeId: string): Promise<void> {
+  await apiFetch<{ ok: boolean }>(`/api/resumes/${resumeId}`, { method: "DELETE" });
+}
+
+/** DOCX 下载：带 JWT 拉取二进制并触发浏览器保存（a[download] 直链带不了 Authorization） */
+export async function downloadResumeDocx(resumeId: string, fileName: string): Promise<void> {
+  const auth = read<StoredAuth | null>(LS.auth, null);
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE}/api/resumes/${resumeId}/download`, {
+      headers: auth?.token ? { Authorization: `Bearer ${auth.token}` } : {},
+    });
+  } catch {
+    throw new Error("无法连接后端服务（apps/api，默认 8000 端口），请确认服务已启动");
+  }
+  if (!res.ok) {
+    let message = `下载失败（HTTP ${res.status}）`;
+    try {
+      const body = (await res.json()) as { detail?: unknown };
+      if (typeof body.detail === "string") message = body.detail;
+    } catch {
+      // 非 JSON 错误体时用状态码描述
+    }
+    throw new Error(message);
+  }
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = fileName.endsWith(".docx") ? fileName : `${fileName}.docx`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+// ---------------- 通知中心 / 数据导出（批 4） ----------------
+
+export async function getNotifications(): Promise<{ unread: number; items: NotificationItem[] }> {
+  return apiFetch<{ unread: number; items: NotificationItem[] }>("/api/notifications");
+}
+
+export async function readNotification(id: string): Promise<void> {
+  await apiFetch<{ ok: boolean }>(`/api/notifications/${id}/read`, { method: "PUT" });
+}
+
+export async function readAllNotifications(): Promise<void> {
+  await apiFetch<{ updated: number }>("/api/notifications/read-all", { method: "PUT" });
+}
+
+/** 数据导出：带 JWT 拉取聚合 JSON 并触发浏览器保存（个人数据副本，第五章） */
+export async function exportMyData(): Promise<void> {
+  const auth = read<StoredAuth | null>(LS.auth, null);
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE}/api/me/export`, {
+      headers: auth?.token ? { Authorization: `Bearer ${auth.token}` } : {},
+    });
+  } catch {
+    throw new Error("无法连接后端服务（apps/api，默认 8000 端口），请确认服务已启动");
+  }
+  if (!res.ok) {
+    let message = `导出失败（HTTP ${res.status}）`;
+    try {
+      const body = (await res.json()) as { detail?: unknown };
+      if (typeof body.detail === "string") message = body.detail;
+    } catch {
+      // 非 JSON 错误体时用状态码描述
+    }
+    throw new Error(message);
+  }
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `个人数据导出-${new Date().toISOString().slice(0, 10).replaceAll("-", "")}.json`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
 }
 
 /** 触发出题任务，返回 task_id（真实调用主模型，进度走 streamGenerate）。
@@ -540,5 +729,136 @@ export async function discoverModels(params: {
   return adminFetch("/api/admin/models/discover", {
     method: "POST",
     body: JSON.stringify(params),
+  });
+}
+
+/* ---------------- 岗位检索（三期，引擎 B） ---------------- */
+
+/** CLI 安装状态 + Boss 登录态（未登录时 /jobs 页展示扫码引导卡） */
+export async function getJobsStatus(): Promise<JobsStatus> {
+  return apiFetch<JobsStatus>("/api/jobs/status");
+}
+
+/** 按需拉起 Boss 专用 Chrome（持久化 profile + CDP 9222）；仅用户显式点击时调用 */
+export async function startBossBrowser(): Promise<BossBrowserStartResult> {
+  return post<BossBrowserStartResult>("/api/jobs/browser/start");
+}
+
+/** 关键词检索岗位（后端分层采样 + 缓存 1 天；同关键词+城市当日命中缓存不重查） */
+export async function searchJobs(keyword: string, city = ""): Promise<JobSearchResult> {
+  return post<JobSearchResult>("/api/jobs/search", { keyword, city });
+}
+
+/** 单岗位全量 JD（缓存 7 天） */
+export async function getJobDetail(securityId: string): Promise<JobDetailResult> {
+  return apiFetch<JobDetailResult>(`/api/jobs/${encodeURIComponent(securityId)}/detail`);
+}
+
+/** 触发引擎 B 出题（岗位检索通道：settings 携带 keyword/city/difficulty/withAnswer） */
+export async function startJobGenerate(params: {
+  keyword: string;
+  city?: string;
+  count: number;
+  difficulty: string;
+  withAnswer: boolean;
+}): Promise<string> {
+  const res = await post<{ taskId: string }>("/api/question-sets/generate", {
+    source: "job_search",
+    settings: {
+      keyword: params.keyword,
+      city: params.city ?? "",
+      count: params.count,
+      difficulty: params.difficulty,
+      withAnswer: params.withAnswer,
+    },
+  });
+  return res.taskId;
+}
+
+/** 触发引擎 C（子集）出题（单岗位专属通道：看板卡上生成，settings 携带 securityId/keyword/city） */
+export async function startJobDetailGenerate(params: {
+  securityId: string;
+  keyword?: string;
+  city?: string;
+  count: number;
+  difficulty: string;
+  withAnswer: boolean;
+}): Promise<string> {
+  const res = await post<{ taskId: string }>("/api/question-sets/generate", {
+    source: "jd_target",
+    settings: {
+      securityId: params.securityId,
+      keyword: params.keyword ?? "",
+      city: params.city ?? "",
+      count: params.count,
+      difficulty: params.difficulty,
+      withAnswer: params.withAnswer,
+    },
+  });
+  return res.taskId;
+}
+
+/** 岗位考点地图（未生成过时后端 404，由调用方提示） */
+export async function getJobMap(keyword: string, city = ""): Promise<JobMap> {
+  const query = new URLSearchParams({ keyword, city });
+  return apiFetch<JobMap>(`/api/jobs/map?${query.toString()}`);
+}
+
+/* ---------------- 每日一练（三期） ---------------- */
+
+/** 当日每日一练（首次访问后端惰性生成：薄弱知识点 60% + 随机 40%，共 10 题） */
+export async function getDailyPractice(): Promise<DailyPractice> {
+  return apiFetch<DailyPractice>("/api/daily-practice");
+}
+
+/** 标记一题完成（判分本体走 practice/submit；全部完成时后端自动打卡） */
+export async function markDailyProgress(questionId: string): Promise<DailyProgressResult> {
+  return post<DailyProgressResult>("/api/daily-practice/progress", { questionId });
+}
+
+/* ---------------- 求职看板（四期，job_pipeline 四列状态机） ---------------- */
+
+/** 四列看板 + 趋势统计（后端顺带惰性触发面试临近提醒） */
+export async function getPipeline(): Promise<PipelineBoard> {
+  return apiFetch<PipelineBoard>("/api/pipeline");
+}
+
+/** 加入看板：zhipin 卡传 securityId+keyword（自动回填匹配分+挂题集）；手动卡传岗位字段 */
+export async function addPipelineCard(input: PipelineAddInput): Promise<PipelineCard> {
+  return post<PipelineCard>("/api/pipeline", input);
+}
+
+/** 流转阶段 / 改备注 / 设面试日期 / 换挂题集 */
+export async function updatePipelineCard(
+  cardId: string,
+  patch: PipelinePatchInput,
+): Promise<PipelineCard> {
+  return apiFetch<PipelineCard>(`/api/pipeline/${encodeURIComponent(cardId)}`, {
+    method: "PATCH",
+    body: JSON.stringify(patch),
+  });
+}
+
+/** 移入回收站（软删） */
+export async function deletePipelineCard(cardId: string): Promise<void> {
+  await apiFetch<{ ok: boolean }>(`/api/pipeline/${encodeURIComponent(cardId)}`, {
+    method: "DELETE",
+  });
+}
+
+/** 回收站列表 */
+export async function getPipelineTrash(): Promise<{ cards: PipelineCard[] }> {
+  return apiFetch<{ cards: PipelineCard[] }>("/api/pipeline/trash");
+}
+
+/** 从回收站还原 */
+export async function restorePipelineCard(cardId: string): Promise<PipelineCard> {
+  return post<PipelineCard>(`/api/pipeline/${encodeURIComponent(cardId)}/restore`);
+}
+
+/** 彻底删除（回收站永久删除） */
+export async function purgePipelineCard(cardId: string): Promise<void> {
+  await apiFetch<{ ok: boolean }>(`/api/pipeline/${encodeURIComponent(cardId)}/permanent`, {
+    method: "DELETE",
   });
 }

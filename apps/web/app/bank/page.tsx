@@ -1,9 +1,10 @@
 "use client";
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
 import { PageHeader, ProgressBar, SOURCE_TAG_CLASS } from "@/components/ui";
-import { createSet, deleteSet, getProgress, getSets } from "@/lib/api";
+import { createExam, createSet, deleteSet, getExams, getProgress, getSets } from "@/lib/api";
 import { SOURCE_LABEL, type QuestionSet, type QuestionSource } from "@/lib/types";
 
 const FILTERS: { key: QuestionSource | "all"; label: string }[] = [
@@ -18,6 +19,7 @@ const FILTERS: { key: QuestionSource | "all"; label: string }[] = [
 const SOURCE_OPTIONS = FILTERS.slice(1);
 
 export default function BankPage() {
+  const router = useRouter();
   const [sets, setSets] = useState<QuestionSet[]>([]);
   const [progressMap, setProgressMap] = useState<Record<string, number>>({});
   const [filter, setFilter] = useState<QuestionSource | "all">("all");
@@ -27,6 +29,8 @@ export default function BankPage() {
   const [newSource, setNewSource] = useState<QuestionSource>("resume");
   const [confirmDelete, setConfirmDelete] = useState<QuestionSet | null>(null);
   const [toast, setToast] = useState<string | null>(null);
+  // 模拟考试：检测进行中的考试（弹「恢复上次考试」）；examBusy 防连点
+  const [examBusyFor, setExamBusyFor] = useState<string | null>(null);
 
   const refresh = async () => {
     const list = await getSets();
@@ -63,6 +67,24 @@ export default function BankPage() {
     notify(`已删除题集「${confirmDelete.title}」`);
     setConfirmDelete(null);
     await refresh();
+  };
+
+  /** 模拟考试入口：有进行中考试先弹恢复确认，否则直接组卷进考试页 */
+  const onStartExam = async (s: QuestionSet) => {
+    setExamBusyFor(s.id);
+    try {
+      const running = (await getExams()).find((e) => e.status === "running" || e.status === "paused");
+      if (running && window.confirm(`有一场未完成的考试（已答 ${running.answered}/${running.total} 题），是否恢复该场考试？\n确定 = 恢复上次考试；取消 = 开新卷。`)) {
+        router.push(`/exam/${running.examId}`);
+        return;
+      }
+      const paper = await createExam(s.id);
+      router.push(`/exam/${paper.examId}`);
+    } catch (e) {
+      notify(e instanceof Error ? e.message : "组卷失败，请重试");
+    } finally {
+      setExamBusyFor(null);
+    }
   };
 
   const filtered = useMemo(
@@ -136,15 +158,19 @@ export default function BankPage() {
                   <span className={`tag ${SOURCE_TAG_CLASS[s.source]}`}>{SOURCE_LABEL[s.source]}</span>
                   <div className="flex items-center gap-2">
                     <span className="text-xs text-muted">{s.updatedAt}</span>
-                    <button
-                      className="text-muted transition-colors hover:text-danger"
-                      title={`删除题集「${s.title}」`}
-                      onClick={() => setConfirmDelete(s)}
-                    >
-                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
-                        <path d="M3 6h18M8 6V4h8v2m-9 0l1 14h8l1-14M10 10v7M14 10v7" strokeLinecap="round" strokeLinejoin="round" />
-                      </svg>
-                    </button>
+                    {s.ownerId ? (
+                      <button
+                        className="text-muted transition-colors hover:text-danger"
+                        title={`删除题集「${s.title}」`}
+                        onClick={() => setConfirmDelete(s)}
+                      >
+                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+                          <path d="M3 6h18M8 6V4h8v2m-9 0l1 14h8l1-14M10 10v7M14 10v7" strokeLinecap="round" strokeLinejoin="round" />
+                        </svg>
+                      </button>
+                    ) : (
+                      <span className="text-xs text-muted/70" title="预置公共题库，所有人共享，不可删除">公共</span>
+                    )}
                   </div>
                 </div>
                 <h3 className="mt-3 text-base font-semibold">{s.title}</h3>
@@ -161,12 +187,22 @@ export default function BankPage() {
                 {s.questionCount === 0 ? (
                   <span className="btn-secondary w-full cursor-not-allowed opacity-60">暂无题目</span>
                 ) : (
-                  <Link
-                    href={`/practice/${s.id}`}
-                    className={finished ? "btn-secondary w-full" : "btn-primary w-full"}
-                  >
-                    {finished ? "再刷一遍" : started ? "继续刷题" : "开始刷题"}
-                  </Link>
+                  <div className="flex gap-2">
+                    <Link
+                      href={`/practice/${s.id}`}
+                      className={(finished ? "btn-secondary" : "btn-primary") + " flex-1 text-center"}
+                    >
+                      {finished ? "再刷一遍" : started ? "继续刷题" : "开始刷题"}
+                    </Link>
+                    <button
+                      className="btn-secondary shrink-0 !px-3.5 text-xs"
+                      title="抽客观题组卷，限时作答，生成模考报告"
+                      onClick={() => onStartExam(s)}
+                      disabled={examBusyFor !== null}
+                    >
+                      {examBusyFor === s.id ? "组卷中…" : "模拟考试"}
+                    </button>
+                  </div>
                 )}
               </div>
             );

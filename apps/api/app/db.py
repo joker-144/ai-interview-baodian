@@ -33,8 +33,10 @@ DEFAULTS = {
     "charset": "utf8mb4",
 }
 
-_lock = threading.Lock()
-_conn: Any = None
+# 连接按线程隔离：FastAPI 同步端点跑在线程池、后台出题任务跑在事件循环线程，
+# pymysql 连接非线程安全——多线程共用同一连接会在并发请求下损坏协议流
+# （随机报 "read of closed file" 等读库失败，进而误降级内存态、看板被清空）。
+_local = threading.local()
 _last_warn_at = 0.0
 
 
@@ -58,28 +60,33 @@ def _warn(message: str) -> None:
 
 
 def connection() -> Any:
-    """取缓存连接；断线自动重连。失败向上抛异常，由调用方决定降级。"""
-    global _conn
-    with _lock:
-        if _conn is not None:
-            try:
-                _conn.ping(reconnect=True)
-                return _conn
-            except Exception:
-                _conn = None
-        cfg = _config()
-        import pymysql  # 延迟导入：依赖缺失不影响应用启动
+    """取本线程缓存连接；断线自动重连。失败向上抛异常，由调用方决定降级。
 
-        _conn = pymysql.connect(
-            host=cfg["host"],
-            port=int(cfg["port"]),
-            user=cfg["user"],
-            password=cfg["password"],
-            database=cfg["database"],
-            charset=cfg.get("charset", "utf8mb4"),
-            autocommit=True,
-        )
-        return _conn
+    线程隔离（threading.local）：线程池上限有限（anyio 默认 40），连接数可控；
+    结构升级 _ensure_upgrade 自带进程级只跑一次的守卫，不会逐线程重跑。
+    """
+    conn = getattr(_local, "conn", None)
+    if conn is not None:
+        try:
+            conn.ping(reconnect=True)
+            return conn
+        except Exception:
+            _local.conn = None
+    cfg = _config()
+    import pymysql  # 延迟导入：依赖缺失不影响应用启动
+
+    conn = pymysql.connect(
+        host=cfg["host"],
+        port=int(cfg["port"]),
+        user=cfg["user"],
+        password=cfg["password"],
+        database=cfg["database"],
+        charset=cfg.get("charset", "utf8mb4"),
+        autocommit=True,
+    )
+    _ensure_upgrade(conn)
+    _local.conn = conn
+    return conn
 
 
 def available() -> bool:
@@ -89,6 +96,230 @@ def available() -> bool:
     except Exception as exc:
         _warn(str(exc))
         return False
+
+
+# 结构自动升级只跑一次（进程级）；schema.sql 始终为最新全量，旧库免重跑
+_upgrade_done = False
+
+
+def _ensure_upgrade(conn: Any) -> None:
+    """旧库幂等升级：补建二期新表 / 新列（MySQL 无 ADD COLUMN IF NOT EXISTS，逐条容忍已存在）。"""
+    global _upgrade_done
+    if _upgrade_done:
+        return
+    _upgrade_done = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS study_plans ("
+                "  id             VARCHAR(64)  NOT NULL COMMENT '计划任务 id',"
+                "  user_id        VARCHAR(64)  NOT NULL COMMENT '所属用户（JWT sub）',"
+                "  plan_date      DATE         NOT NULL COMMENT '计划日期',"
+                "  type           VARCHAR(16)  NOT NULL DEFAULT 'practice' COMMENT '任务类型',"
+                "  title          VARCHAR(255) NOT NULL COMMENT '任务标题',"
+                "  est_minutes    INT          NOT NULL DEFAULT 15 COMMENT '时长预估（分钟）',"
+                "  done           TINYINT(1)   NOT NULL DEFAULT 0 COMMENT '是否完成',"
+                "  auto_generated TINYINT(1)   NOT NULL DEFAULT 0 COMMENT '是否 AI 生成',"
+                "  ref_id         VARCHAR(64)  NULL COMMENT '关联资源 id',"
+                "  created_at     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+                "  PRIMARY KEY (id),"
+                "  KEY idx_plans_user_date (user_id, plan_date)"
+                ") ENGINE = InnoDB DEFAULT CHARSET = utf8mb4"
+            )
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS exam_records ("
+                "  id              VARCHAR(64)  NOT NULL COMMENT '考试 id',"
+                "  user_id         VARCHAR(64)  NOT NULL COMMENT '所属用户（JWT sub）',"
+                "  set_id          VARCHAR(64)  NOT NULL COMMENT '出卷题集 id',"
+                "  bucket_role     VARCHAR(64)  NOT NULL DEFAULT '' COMMENT '岗位分桶',"
+                "  total           INT          NOT NULL DEFAULT 0 COMMENT '卷面题量',"
+                "  question_ids    JSON         NOT NULL COMMENT '组卷快照',"
+                "  answered_detail JSON         NULL COMMENT '已答明细（逐题覆盖写）',"
+                "  score           INT          NULL COMMENT '百分制得分',"
+                "  duration_sec    INT          NOT NULL DEFAULT 0 COMMENT '有效作答用时',"
+                "  paused_sec      INT          NOT NULL DEFAULT 0 COMMENT '累计暂停秒数',"
+                "  status          VARCHAR(16)  NOT NULL DEFAULT 'running' COMMENT 'running / paused / done / abandoned',"
+                "  created_at      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '开考时间',"
+                "  finished_at     DATETIME     NULL COMMENT '交卷时间',"
+                "  PRIMARY KEY (id),"
+                "  KEY idx_exams_user (user_id, status),"
+                "  KEY idx_exams_role (bucket_role, status)"
+                ") ENGINE = InnoDB DEFAULT CHARSET = utf8mb4"
+            )
+            try:
+                cur.execute(
+                    "ALTER TABLE users ADD COLUMN last_checkin_date DATE NULL "
+                    "COMMENT '最近一次学习计划打卡达成日' AFTER deactivation_executed_at"
+                )
+            except Exception:
+                pass  # 列已存在
+            try:
+                # 旧库 job_details.security_id 为 VARCHAR(64)，而 BOSS 真实 security_id 可长达 ~340 字符，
+                # 写库会报 (1406, Data too long)；幂等拓宽到 VARCHAR(512)（utf8mb4 下 PK 前缀 2048B < 3072B 上限）。
+                cur.execute(
+                    "ALTER TABLE job_details MODIFY security_id VARCHAR(512) NOT NULL "
+                    "COMMENT 'BOSS 岗位 security_id（实测可长达 ~340 字符）'"
+                )
+            except Exception:
+                pass  # 表不存在或已是目标宽度
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS notifications ("
+                "  id           VARCHAR(64)  NOT NULL COMMENT '通知 id',"
+                "  user_id      VARCHAR(64)  NOT NULL COMMENT '所属用户（JWT sub）',"
+                "  type         VARCHAR(32)  NOT NULL COMMENT 'generate_done / exam_report / review_due',"
+                "  payload_json JSON         NULL COMMENT '通知负载',"
+                "  `read`       TINYINT(1)   NOT NULL DEFAULT 0 COMMENT '是否已读',"
+                "  created_at   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+                "  PRIMARY KEY (id),"
+                "  KEY idx_notifications_user (user_id, `read`)"
+                ") ENGINE = InnoDB DEFAULT CHARSET = utf8mb4"
+            )
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS jobs_cache ("
+                "  cache_key    VARCHAR(64)  NOT NULL COMMENT '缓存 key（sha256(关键词|城市)）',"
+                "  keyword      VARCHAR(128) NOT NULL COMMENT '检索关键词',"
+                "  city         VARCHAR(64)  NOT NULL DEFAULT '' COMMENT '城市',"
+                "  payload_json JSON         NOT NULL COMMENT '采样后的岗位卡列表',"
+                "  expires_at   DATETIME     NOT NULL COMMENT '过期时间',"
+                "  created_at   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+                "  PRIMARY KEY (cache_key),"
+                "  KEY idx_jobs_cache_exp (expires_at)"
+                ") ENGINE = InnoDB DEFAULT CHARSET = utf8mb4"
+            )
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS job_details ("
+                "  security_id  VARCHAR(512) NOT NULL COMMENT 'BOSS 岗位 security_id（实测可长达 ~340 字符）',"
+                "  keyword      VARCHAR(128) NOT NULL DEFAULT '' COMMENT '来源检索关键词',"
+                "  payload_json JSON         NOT NULL COMMENT 'JD 全量详情',"
+                "  expires_at   DATETIME     NOT NULL COMMENT '过期时间',"
+                "  created_at   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+                "  PRIMARY KEY (security_id),"
+                "  KEY idx_job_details_exp (expires_at)"
+                ") ENGINE = InnoDB DEFAULT CHARSET = utf8mb4"
+            )
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS job_maps ("
+                "  map_key      VARCHAR(64)  NOT NULL COMMENT '缓存 key（sha256(关键词|城市)）',"
+                "  keyword      VARCHAR(128) NOT NULL COMMENT '检索关键词',"
+                "  city         VARCHAR(64)  NOT NULL DEFAULT '' COMMENT '城市',"
+                "  payload_json JSON         NOT NULL COMMENT '聚合报告（topSkills/duties/salaryInsight/tiers）',"
+                "  expires_at   DATETIME     NOT NULL COMMENT '过期时间',"
+                "  created_at   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+                "  PRIMARY KEY (map_key),"
+                "  KEY idx_job_maps_exp (expires_at)"
+                ") ENGINE = InnoDB DEFAULT CHARSET = utf8mb4"
+            )
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS daily_practices ("
+                "  id             VARCHAR(64)  NOT NULL COMMENT '每日一练 id',"
+                "  user_id        VARCHAR(64)  NOT NULL COMMENT '所属用户（JWT sub）',"
+                "  practice_date  DATE         NOT NULL COMMENT '练习日期',"
+                "  question_ids   JSON         NOT NULL COMMENT '当日 10 题快照',"
+                "  done_ids       JSON         NULL COMMENT '已完成题目 id 数组',"
+                "  created_at     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+                "  PRIMARY KEY (id),"
+                "  UNIQUE KEY uk_daily_user_date (user_id, practice_date)"
+                ") ENGINE = InnoDB DEFAULT CHARSET = utf8mb4"
+            )
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS job_pipeline ("
+                "  id            VARCHAR(64)  NOT NULL COMMENT '看板卡 id',"
+                "  user_id       VARCHAR(64)  NOT NULL COMMENT '所属用户（JWT sub）',"
+                "  stage         VARCHAR(16)  NOT NULL DEFAULT 'applied',"
+                "  security_id   VARCHAR(512) NOT NULL DEFAULT '',"
+                "  keyword       VARCHAR(128) NOT NULL DEFAULT '',"
+                "  job_name      VARCHAR(255) NOT NULL DEFAULT '',"
+                "  brand         VARCHAR(255) NOT NULL DEFAULT '',"
+                "  city          VARCHAR(64)  NOT NULL DEFAULT '',"
+                "  salary        VARCHAR(64)  NOT NULL DEFAULT '',"
+                "  platform      VARCHAR(16)  NOT NULL DEFAULT 'zhipin',"
+                "  match_score   INT          NULL,"
+                "  set_id        VARCHAR(64)  NOT NULL DEFAULT '',"
+                "  interview_at  DATE         NULL,"
+                "  note          TEXT         NULL,"
+                "  in_trash      TINYINT      NOT NULL DEFAULT 0,"
+                "  created_at    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+                "  updated_at    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,"
+                "  PRIMARY KEY (id),"
+                "  KEY idx_pipeline_user_stage (user_id, stage),"
+                "  KEY idx_pipeline_user_trash (user_id, in_trash)"
+                ") ENGINE = InnoDB DEFAULT CHARSET = utf8mb4"
+            )
+            # 题库归属隔离：旧库补 owner_id 列（空=公共题库/预置种子），幂等容忍已存在
+            try:
+                cur.execute(
+                    "ALTER TABLE question_sets ADD COLUMN owner_id VARCHAR(64) NOT NULL DEFAULT '' "
+                    "COMMENT '归属用户 user_id（空=公共题库/预置种子）' AFTER source"
+                )
+                cur.execute(
+                    "ALTER TABLE question_sets ADD KEY idx_question_sets_owner (owner_id)"
+                )
+            except Exception:
+                pass  # 列/索引已存在
+            try:
+                # 历史引擎生成题集按出题任务回填真实归属者（set_id -> user_id）
+                cur.execute(
+                    "UPDATE question_sets qs JOIN ("
+                    "  SELECT set_id, MIN(user_id) AS uid FROM generate_tasks GROUP BY set_id"
+                    ") gt ON gt.set_id = qs.id SET qs.owner_id = gt.uid WHERE qs.owner_id = ''"
+                )
+                # 无任务关联的历史题集（手动自建）兜底归属 smoke_db_user；库中不含预置种子，安全
+                cur.execute(
+                    "UPDATE question_sets SET owner_id = ("
+                    "  SELECT user_id FROM users WHERE account = 'smoke_db_user' LIMIT 1) "
+                    "WHERE owner_id = '' "
+                    "AND EXISTS (SELECT 1 FROM users WHERE account = 'smoke_db_user')"
+                )
+            except Exception as exc:
+                _warn(f"question_sets.owner_id 回填失败（不影响隔离逻辑，新题集仍按用户归属）：{exc}")
+            # 演示账号种子曾写入伪造进度（累计作答 1024 / 答对率 78 / 连续 12 天）；
+            # 进度统一改为真实作答事件驱动，将未被真实使用过的 demo 底数归零（幂等，不伤真实数据）
+            try:
+                cur.execute(
+                    "UPDATE users SET streak = 0, total_answered = 0, correct_rate = 0 "
+                    "WHERE user_id = 'demo-user' AND total_answered = 1024 "
+                    "AND correct_rate = 78 AND streak = 12"
+                )
+            except Exception as exc:
+                _warn(f"demo 演示进度归零失败（不影响真实统计）：{exc}")
+            # resumes 旧结构（user_id 主键单行）自动迁移为多版本表；失败不阻塞主链路
+            try:
+                cur.execute("SELECT version FROM resumes LIMIT 1")
+                cur.fetchall()
+            except Exception:
+                try:
+                    cur.execute("RENAME TABLE resumes TO resumes_legacy")
+                    cur.execute(
+                        "CREATE TABLE resumes ("
+                        "  resume_id    VARCHAR(64)  NOT NULL COMMENT '简历版本 id',"
+                        "  user_id      VARCHAR(64)  NOT NULL COMMENT '所属用户（JWT sub）',"
+                        "  version      INT          NOT NULL DEFAULT 1 COMMENT '版本号',"
+                        "  is_optimized TINYINT(1)   NOT NULL DEFAULT 0 COMMENT '是否 AI 优化版',"
+                        "  file_name    VARCHAR(255) NOT NULL DEFAULT '' COMMENT '上传文件名',"
+                        "  text         MEDIUMTEXT   NULL COMMENT '简历原文',"
+                        "  summary      MEDIUMTEXT   NULL COMMENT 'AI 画像摘要',"
+                        "  analysis     JSON         NULL COMMENT '结构化解析结果（含体检）',"
+                        "  created_at   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '入库时间',"
+                        "  PRIMARY KEY (resume_id),"
+                        "  KEY idx_resumes_user (user_id)"
+                        ") ENGINE = InnoDB DEFAULT CHARSET = utf8mb4"
+                    )
+                    cur.execute(
+                        "INSERT INTO resumes (resume_id, user_id, version, is_optimized, "
+                        "file_name, text, summary, analysis, created_at) "
+                        "SELECT CONCAT(user_id, '-v1'), user_id, 1, 0, file_name, text, "
+                        "summary, analysis, updated_at FROM resumes_legacy"
+                    )
+                    cur.execute("DROP TABLE resumes_legacy")
+                    conn.commit()
+                    logger.warning("resumes 表已自动迁移为多版本结构（旧单行 -> version=1）")
+                except Exception as exc:
+                    _warn(
+                        f"resumes 表旧结构自动迁移失败（不影响内存态运行），"
+                        f"请按 sql/schema.sql 头部说明手工迁移：{exc}"
+                    )
+    except Exception as exc:
+        _warn(f"库结构自动升级失败（不影响内存态运行）：{exc}")
 
 
 def _fmt(dt: datetime) -> str:
@@ -107,7 +338,7 @@ def load_bank() -> tuple[list[dict[str, Any]], list[dict[str, Any]]] | None:
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id, source, title, question_count, updated_at "
+                "SELECT id, source, title, question_count, updated_at, owner_id "
                 "FROM question_sets ORDER BY updated_at DESC"
             )
             set_rows = cur.fetchall()
@@ -120,6 +351,7 @@ def load_bank() -> tuple[list[dict[str, Any]], list[dict[str, Any]]] | None:
                     "title": r[2],
                     "questionCount": r[3],
                     "updatedAt": _fmt(r[4]),
+                    "ownerId": r[5] or "",
                 }
                 for r in set_rows
             ]
@@ -158,11 +390,11 @@ def save_set(s: dict[str, Any]) -> None:
         conn = connection()
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO question_sets (id, source, title, question_count) "
-                "VALUES (%s, %s, %s, %s) "
+                "INSERT INTO question_sets (id, source, title, question_count, owner_id) "
+                "VALUES (%s, %s, %s, %s, %s) "
                 "ON DUPLICATE KEY UPDATE title = VALUES(title), "
                 "question_count = VALUES(question_count), updated_at = CURRENT_TIMESTAMP",
-                (s["id"], s["source"], s["title"], s.get("questionCount", 0)),
+                (s["id"], s["source"], s["title"], s.get("questionCount", 0), s.get("ownerId", "")),
             )
     except Exception as exc:
         _warn(f"题集写库失败：{exc}")
@@ -232,6 +464,16 @@ def _str_or_empty(dt: datetime | None) -> str:
     return dt.strftime(_DT_FMT) if dt else ""
 
 
+def _date_or_none(value: str | None) -> datetime | None:
+    """lastCheckinDate（YYYY-MM-DD）→ DATE；空串 / 格式错返回 NULL。"""
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        return None
+
+
 def _wrong_at_label(dt: datetime) -> str:
     """错题 lastWrongAt 的重启后展示口径：当天 → 今天 HH:MM，更早 → MM-DD HH:MM。"""
     now = datetime.now()
@@ -260,7 +502,7 @@ def load_user(user_id: str) -> dict[str, Any] | None:
                 "correct_rate, phone, wechat_bound, review_reminder_enabled, "
                 "review_reminder_time, deactivation_status, deactivation_requested_at, "
                 "deactivation_cooling_until, deactivation_reason, deactivation_scopes, "
-                "deactivation_executed_at FROM users WHERE user_id = %s",
+                "deactivation_executed_at, last_checkin_date FROM users WHERE user_id = %s",
                 (user_id,),
             )
             row = cur.fetchone()
@@ -271,6 +513,8 @@ def load_user(user_id: str) -> dict[str, Any] | None:
                 "name": row[0], "avatarText": row[1], "targetRole": row[2], "years": row[3],
                 "streak": row[4], "totalAnswered": row[5], "correctRate": row[6],
                 "phone": row[7], "wechatBound": bool(row[8]),
+                # 打卡日期不外发，仅用于服务端判断「同日不重复计 streak」
+                "lastCheckinDate": row[17].strftime("%Y-%m-%d") if row[17] else "",
             }
             settings = {
                 "reviewReminderEnabled": bool(row[9]),
@@ -321,7 +565,8 @@ def load_user(user_id: str) -> dict[str, Any] | None:
             favorites = [r[0] for r in cur.fetchall()]
 
             cur.execute(
-                "SELECT file_name, text, summary, analysis FROM resumes WHERE user_id = %s",
+                "SELECT file_name, text, summary, analysis FROM resumes "
+                "WHERE user_id = %s ORDER BY version DESC, created_at DESC LIMIT 1",
                 (user_id,),
             )
             resume = cur.fetchone()
@@ -366,8 +611,8 @@ def save_user(user_id: str, profile: dict[str, Any], settings: dict[str, Any],
                 "total_answered, correct_rate, phone, wechat_bound, review_reminder_enabled, "
                 "review_reminder_time, deactivation_status, deactivation_requested_at, "
                 "deactivation_cooling_until, deactivation_reason, deactivation_scopes, "
-                "deactivation_executed_at) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                "deactivation_executed_at, last_checkin_date) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
                 "ON DUPLICATE KEY UPDATE name=VALUES(name), avatar_text=VALUES(avatar_text), "
                 "target_role=VALUES(target_role), years=VALUES(years), streak=VALUES(streak), "
                 "total_answered=VALUES(total_answered), correct_rate=VALUES(correct_rate), "
@@ -379,7 +624,8 @@ def save_user(user_id: str, profile: dict[str, Any], settings: dict[str, Any],
                 "deactivation_cooling_until=VALUES(deactivation_cooling_until), "
                 "deactivation_reason=VALUES(deactivation_reason), "
                 "deactivation_scopes=VALUES(deactivation_scopes), "
-                "deactivation_executed_at=VALUES(deactivation_executed_at)",
+                "deactivation_executed_at=VALUES(deactivation_executed_at), "
+                "last_checkin_date=VALUES(last_checkin_date)",
                 (
                     user_id,
                     profile.get("name", ""), profile.get("avatarText", ""),
@@ -395,6 +641,7 @@ def save_user(user_id: str, profile: dict[str, Any], settings: dict[str, Any],
                     deact.get("reason", ""),
                     json.dumps(deact.get("scopes", []), ensure_ascii=False) if deact else None,
                     _dt_or_none(deact.get("executedAt")),
+                    _date_or_none(profile.get("lastCheckinDate")),
                 ),
             )
     except Exception as exc:
@@ -533,29 +780,379 @@ def delete_favorite(user_id: str, question_id: str) -> None:
         _warn(f"收藏删库失败：{exc}")
 
 
-def save_resume(user_id: str, analysis: dict[str, Any] | None, text: str, summary: str) -> None:
-    """最近一份简历的解析产物 upsert。"""
+# ---------------- 今日学习计划（二期） ----------------
+
+
+def load_plans(user_id: str, plan_date: str) -> list[dict[str, Any]]:
+    """取某用户某天的计划任务（按创建顺序）。"""
     try:
         conn = connection()
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO resumes (user_id, file_name, text, summary, analysis) "
-                "VALUES (%s, %s, %s, %s, %s) "
-                "ON DUPLICATE KEY UPDATE file_name=VALUES(file_name), text=VALUES(text), "
-                "summary=VALUES(summary), analysis=VALUES(analysis)",
+                "SELECT id, type, title, est_minutes, done, auto_generated, ref_id "
+                "FROM study_plans WHERE user_id = %s AND plan_date = %s ORDER BY created_at, id",
+                (user_id, plan_date),
+            )
+            return [
+                {
+                    "id": r[0], "type": r[1], "title": r[2], "estMinutes": int(r[3]),
+                    "done": bool(r[4]), "autoGenerated": bool(r[5]), "refId": r[6],
+                }
+                for r in cur.fetchall()
+            ]
+    except Exception as exc:
+        _warn(f"学习计划读取失败：{exc}")
+        return []
+
+
+def save_plan(user_id: str, plan_date: str, item: dict[str, Any]) -> None:
+    """计划任务 upsert（id 主键；勾选切换 / 生成 / 添加都走这里）。"""
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO study_plans (id, user_id, plan_date, type, title, est_minutes, "
+                "done, auto_generated, ref_id) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                "ON DUPLICATE KEY UPDATE type=VALUES(type), title=VALUES(title), "
+                "est_minutes=VALUES(est_minutes), done=VALUES(done), "
+                "auto_generated=VALUES(auto_generated), ref_id=VALUES(ref_id)",
                 (
-                    user_id,
-                    (analysis or {}).get("fileName", ""),
-                    text, summary,
-                    json.dumps(analysis, ensure_ascii=False) if analysis else None,
+                    item["id"], user_id, plan_date, item.get("type", "practice"),
+                    item["title"], int(item.get("estMinutes", 15)),
+                    1 if item.get("done") else 0,
+                    1 if item.get("autoGenerated") else 0,
+                    item.get("refId"),
                 ),
             )
     except Exception as exc:
-        _warn(f"简历解析产物写库失败：{exc}")
+        _warn(f"学习计划写库失败：{exc}")
+
+
+def delete_plan(user_id: str, plan_id: str) -> None:
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM study_plans WHERE user_id = %s AND id = %s",
+                (user_id, plan_id),
+            )
+    except Exception as exc:
+        _warn(f"学习计划删库失败：{exc}")
+
+
+def load_week_events(user_id: str, days: int = 7) -> list[dict[str, Any]]:
+    """近 N 天逐日作答聚合（周报 / 本周图表源）；库不可用返回空列表。"""
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT DATE(created_at), COUNT(*), SUM(is_correct) FROM answer_events "
+                "WHERE user_id = %s AND created_at >= CURDATE() - INTERVAL %s DAY "
+                "GROUP BY DATE(created_at) ORDER BY DATE(created_at)",
+                (user_id, int(days) - 1),
+            )
+            return [
+                {"date": str(r[0]), "answered": int(r[1]), "correct": int(r[2] or 0)}
+                for r in cur.fetchall()
+            ]
+    except Exception as exc:
+        _warn(f"周作答聚合读取失败：{exc}")
+        return []
+
+
+def load_user_answer_totals(user_id: str) -> dict[str, int] | None:
+    """累计作答口径（全部时间）：从 answer_events 聚合 {answered, correct}；库不可用返回 None。"""
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*), SUM(is_correct) FROM answer_events WHERE user_id = %s",
+                (user_id,),
+            )
+            row = cur.fetchone()
+            return {"answered": int(row[0] or 0), "correct": int(row[1] or 0)}
+    except Exception as exc:
+        _warn(f"累计作答聚合读取失败：{exc}")
+        return None
+
+
+# ---------------- 模拟考试（二期） ----------------
+
+
+def save_exam_record(exam: dict[str, Any]) -> None:
+    """考试记录 upsert 全行：作答/暂停/交卷每次变更都覆盖写（增量口径由调用方保证）。"""
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO exam_records (id, user_id, set_id, bucket_role, total, "
+                "question_ids, answered_detail, score, duration_sec, paused_sec, status, "
+                "created_at, finished_at) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                "ON DUPLICATE KEY UPDATE answered_detail=VALUES(answered_detail), "
+                "score=VALUES(score), duration_sec=VALUES(duration_sec), "
+                "paused_sec=VALUES(paused_sec), status=VALUES(status), "
+                "finished_at=VALUES(finished_at)",
+                (
+                    exam["id"], exam["userId"], exam["setId"], exam.get("bucketRole", ""),
+                    int(exam.get("total", 0)),
+                    json.dumps(exam.get("questionIds", []), ensure_ascii=False),
+                    json.dumps(exam.get("answers", []), ensure_ascii=False) or None,
+                    exam.get("score"), int(exam.get("durationSec", 0)),
+                    int(exam.get("pausedSec", 0)), exam.get("status", "running"),
+                    exam.get("createdAt") or datetime.now(),
+                    exam.get("finishedAt"),
+                ),
+            )
+            conn.commit()
+    except Exception as exc:
+        _warn(f"考试记录写库失败：{exc}")
+
+
+def load_exam(user_id: str, exam_id: str) -> dict[str, Any] | None:
+    """取一条考试记录（属主校验由调用方做；库不可用返回 None）。"""
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, user_id, set_id, bucket_role, total, question_ids, "
+                "answered_detail, score, duration_sec, paused_sec, status, created_at, "
+                "finished_at FROM exam_records WHERE id = %s AND user_id = %s",
+                (exam_id, user_id),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            return _exam_row(row)
+    except Exception as exc:
+        _warn(f"考试记录读取失败：{exc}")
+        return None
+
+
+def load_exams(user_id: str) -> list[dict[str, Any]]:
+    """该用户全部考试记录（倒序，历史列表与趋势源）。"""
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, user_id, set_id, bucket_role, total, question_ids, "
+                "answered_detail, score, duration_sec, paused_sec, status, created_at, "
+                "finished_at FROM exam_records WHERE user_id = %s "
+                "ORDER BY created_at DESC, id DESC",
+                (user_id,),
+            )
+            return [_exam_row(r) for r in cur.fetchall()]
+    except Exception as exc:
+        _warn(f"考试列表读取失败：{exc}")
+        return []
+
+
+def load_done_scores(bucket_role: str) -> list[int]:
+    """同岗位分桶的已交卷分数（升序，百分位计算源）。"""
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT score FROM exam_records "
+                "WHERE bucket_role = %s AND status = 'done' AND score IS NOT NULL "
+                "ORDER BY score",
+                (bucket_role,),
+            )
+            return [int(r[0]) for r in cur.fetchall()]
+    except Exception as exc:
+        _warn(f"分桶分数读取失败：{exc}")
+        return []
+
+
+def _exam_row(row: tuple) -> dict[str, Any]:
+    """exam_records 行 -> 内存 exam dict（JSON 列已由 PyMySQL 反序列化）。"""
+    return {
+        "id": row[0], "userId": row[1], "setId": row[2], "bucketRole": row[3] or "",
+        "total": int(row[4]),
+        "questionIds": row[5] if isinstance(row[5], list) else json.loads(row[5] or "[]"),
+        "answers": row[6] if isinstance(row[6], list) else json.loads(row[6] or "[]"),
+        "score": int(row[7]) if row[7] is not None else None,
+        "durationSec": int(row[8]), "pausedSec": int(row[9]),
+        "status": row[10],
+        "createdAt": row[11].strftime("%Y-%m-%d %H:%M:%S") if row[11] else "",
+        "finishedAt": row[12].strftime("%Y-%m-%d %H:%M:%S") if row[12] else None,
+    }
+
+
+def _resume_row(row: tuple) -> dict[str, Any]:
+    """resumes v2 行 -> 前端同构 camelCase 记录。"""
+    (resume_id, version, is_optimized, file_name, text, summary, analysis, created_at) = row
+    return {
+        "resumeId": resume_id,
+        "version": int(version or 1),
+        "isOptimized": bool(is_optimized),
+        "fileName": file_name or "",
+        "text": text or "",
+        "summary": summary or "",
+        "analysis": json.loads(analysis) if analysis else None,
+        "createdAt": str(created_at) if created_at else "",
+    }
+
+
+_RESUME_COLS = (
+    "resume_id, version, is_optimized, file_name, text, summary, analysis, created_at"
+)
+
+
+def load_resumes(user_id: str) -> list[dict[str, Any]]:
+    """该用户全部简历版本（version 降序；含体检等完整 analysis）。"""
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT {_RESUME_COLS} FROM resumes WHERE user_id = %s "
+                "ORDER BY version DESC, created_at DESC",
+                (user_id,),
+            )
+            return [_resume_row(r) for r in cur.fetchall()]
+    except Exception as exc:
+        _warn(f"读取简历版本列表失败：{exc}")
+        return []
+
+
+def load_resume(user_id: str, resume_id: str) -> dict[str, Any] | None:
+    """按 id 读一个简历版本。"""
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT {_RESUME_COLS} FROM resumes "
+                "WHERE user_id = %s AND resume_id = %s",
+                (user_id, resume_id),
+            )
+            row = cur.fetchone()
+    except Exception as exc:
+        _warn(f"读取简历版本失败：{exc}")
+        return None
+    return _resume_row(row) if row else None
+
+
+def save_resume_record(rec: dict[str, Any]) -> None:
+    """简历版本行 upsert（新增版本 / 体检惰性补算写回 analysis 都走这里）。"""
+    analysis = rec.get("analysis")
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO resumes (resume_id, user_id, version, is_optimized, "
+                "file_name, text, summary, analysis) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+                "ON DUPLICATE KEY UPDATE is_optimized=VALUES(is_optimized), "
+                "file_name=VALUES(file_name), text=VALUES(text), "
+                "summary=VALUES(summary), analysis=VALUES(analysis)",
+                (
+                    rec["resumeId"], rec["userId"], int(rec.get("version", 1)),
+                    1 if rec.get("isOptimized") else 0,
+                    rec.get("fileName", ""), rec.get("text", ""),
+                    rec.get("summary", ""),
+                    json.dumps(analysis, ensure_ascii=False) if analysis is not None else None,
+                ),
+            )
+    except Exception as exc:
+        _warn(f"简历版本写库失败：{exc}")
+
+
+def delete_resume(user_id: str, resume_id: str) -> None:
+    """删除该用户一个简历版本。"""
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM resumes WHERE user_id = %s AND resume_id = %s",
+                (user_id, resume_id),
+            )
+    except Exception as exc:
+        _warn(f"简历版本删库失败：{exc}")
+
+
+# ---------------- 站内通知（批 4） ----------------
+
+
+def save_notification(rec: dict[str, Any]) -> None:
+    """站内信写入（append-only）。"""
+    payload = rec.get("payload")
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO notifications (id, user_id, type, payload_json, `read`) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                (
+                    rec["id"], rec["userId"], rec["type"],
+                    json.dumps(payload, ensure_ascii=False) if payload is not None else None,
+                    1 if rec.get("read") else 0,
+                ),
+            )
+    except Exception as exc:
+        _warn(f"站内信写库失败：{exc}")
+
+
+def load_notifications(user_id: str, limit: int = 100) -> list[dict[str, Any]]:
+    """站内信倒序列表（created_at 降序；读接口同构 camelCase）。"""
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, type, payload_json, `read`, created_at FROM notifications "
+                "WHERE user_id = %s ORDER BY created_at DESC, id DESC LIMIT %s",
+                (user_id, int(limit)),
+            )
+            rows = cur.fetchall()
+    except Exception as exc:
+        _warn(f"站内信读库失败：{exc}")
+        return []
+    return [
+        {
+            "id": nid,
+            "type": ntype,
+            "payload": json.loads(payload) if payload else None,
+            "read": bool(is_read),
+            "createdAt": str(created_at),
+        }
+        for nid, ntype, payload, is_read, created_at in rows
+    ]
+
+
+def mark_notification_read(user_id: str, notification_id: str) -> bool:
+    """单条已读；返回是否确实更新到行。"""
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            count = cur.execute(
+                "UPDATE notifications SET `read` = 1 "
+                "WHERE user_id = %s AND id = %s AND `read` = 0",
+                (user_id, notification_id),
+            )
+        return bool(count)
+    except Exception as exc:
+        _warn(f"站内信已读写库失败：{exc}")
+        return False
+
+
+def mark_all_notifications_read(user_id: str) -> int:
+    """全部已读；返回更新的行数（库不可用返回 -1，由内存态兜底）。"""
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            count = cur.execute(
+                "UPDATE notifications SET `read` = 1 "
+                "WHERE user_id = %s AND `read` = 0",
+                (user_id,),
+            )
+        return int(count)
+    except Exception as exc:
+        _warn(f"站内信全部已读写库失败：{exc}")
+        return -1
 
 
 def clear_user_data(user_id: str) -> None:
-    """注销清理：删除该用户的进度 / 作答事件 / 错题 / 收藏 / 简历产物（users 行保留注销标记）。"""
+    """注销清理：删除该用户全部数据行（进度 / 作答事件 / 错题 / 收藏 / 简历 / 计划 /
+    模考 / 站内信 / 每日一练 / 求职看板），users 行保留注销标记。"""
     try:
         conn = connection()
         with conn.cursor() as cur:
@@ -565,6 +1162,11 @@ def clear_user_data(user_id: str) -> None:
                 "DELETE FROM wrong_items WHERE user_id = %s",
                 "DELETE FROM favorites WHERE user_id = %s",
                 "DELETE FROM resumes WHERE user_id = %s",
+                "DELETE FROM study_plans WHERE user_id = %s",
+                "DELETE FROM exam_records WHERE user_id = %s",
+                "DELETE FROM notifications WHERE user_id = %s",
+                "DELETE FROM daily_practices WHERE user_id = %s",
+                "DELETE FROM job_pipeline WHERE user_id = %s",
             ):
                 cur.execute(sql, (user_id,))
     except Exception as exc:
@@ -738,3 +1340,256 @@ def dismiss_interrupted_tasks(user_id: str) -> None:
             )
     except Exception as exc:
         _warn(f"中断任务归档失败：{exc}")
+
+
+# ---------------- 岗位检索缓存（三期，TTL 惰性刷新；天数由 store.JOBS_CACHE_TTL_DAYS 决定） ----------------
+
+
+def save_jobs_cache(cache_key: str, keyword: str, city: str, payload: Any, expires_at: str) -> None:
+    """检索结果写入/覆盖（同 key 重查覆盖刷新 TTL），顺带清理过期行。
+
+    created_at 一并刷新为本次抓取时刻：读侧用它按「当前 TTL」裁剪历史行
+    （TTL 调小后，按旧 TTL 写入的存量行不会继续命中）。
+    """
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO jobs_cache (cache_key, keyword, city, payload_json, expires_at) "
+                "VALUES (%s, %s, %s, %s, %s) "
+                "ON DUPLICATE KEY UPDATE keyword = VALUES(keyword), city = VALUES(city), "
+                "payload_json = VALUES(payload_json), expires_at = VALUES(expires_at), "
+                "created_at = CURRENT_TIMESTAMP",
+                (
+                    cache_key, keyword, city,
+                    json.dumps(payload, ensure_ascii=False), expires_at,
+                ),
+            )
+            cur.execute("DELETE FROM jobs_cache WHERE expires_at < NOW()")
+    except Exception as exc:
+        _warn(f"岗位检索缓存写库失败：{exc}")
+
+
+def load_jobs_cache(cache_key: str, max_age_days: int = 0) -> dict[str, Any] | None:
+    """未过期缓存行（含 keyword/city/payload）；过期或无行返回 None。
+
+    max_age_days > 0 时追加「抓取时刻不早于 N 天前」的过滤：expires_at 是写入时按当时
+    TTL 算出的绝对时刻，TTL 调小后存量行仍会显示为未过期，故按 created_at 以当前 TTL 兜底裁剪。
+    """
+    days = max(0, int(max_age_days))
+    sql = "SELECT keyword, city, payload_json FROM jobs_cache WHERE cache_key = %s AND expires_at > NOW()"
+    params: tuple[Any, ...] = (cache_key,)
+    if days:
+        sql += " AND created_at > DATE_SUB(NOW(), INTERVAL %s DAY)"
+        params += (days,)
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            row = cur.fetchone()
+    except Exception as exc:
+        _warn(f"岗位检索缓存读库失败：{exc}")
+        return None
+    if not row:
+        return None
+    return {
+        "keyword": row[0],
+        "city": row[1],
+        "payload": json.loads(row[2]) if row[2] else [],
+    }
+
+
+def save_job_detail(security_id: str, keyword: str, payload: Any, expires_at: str) -> None:
+    """JD 详情写入/覆盖，顺带清理过期行。"""
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO job_details (security_id, keyword, payload_json, expires_at) "
+                "VALUES (%s, %s, %s, %s) "
+                "ON DUPLICATE KEY UPDATE keyword = VALUES(keyword), "
+                "payload_json = VALUES(payload_json), expires_at = VALUES(expires_at)",
+                (
+                    security_id, keyword,
+                    json.dumps(payload, ensure_ascii=False), expires_at,
+                ),
+            )
+            cur.execute("DELETE FROM job_details WHERE expires_at < NOW()")
+    except Exception as exc:
+        _warn(f"JD 详情缓存写库失败：{exc}")
+
+
+def load_job_detail(security_id: str) -> Any | None:
+    """未过期 JD 详情 payload；过期或无行返回 None。"""
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT payload_json FROM job_details "
+                "WHERE security_id = %s AND expires_at > NOW()",
+                (security_id,),
+            )
+            row = cur.fetchone()
+    except Exception as exc:
+        _warn(f"JD 详情缓存读库失败：{exc}")
+        return None
+    return json.loads(row[0]) if row and row[0] else None
+
+
+def save_job_map(map_key: str, keyword: str, city: str, payload: Any, expires_at: str) -> None:
+    """考点地图报告写入/覆盖，顺带清理过期行。"""
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO job_maps (map_key, keyword, city, payload_json, expires_at) "
+                "VALUES (%s, %s, %s, %s, %s) "
+                "ON DUPLICATE KEY UPDATE keyword = VALUES(keyword), city = VALUES(city), "
+                "payload_json = VALUES(payload_json), expires_at = VALUES(expires_at)",
+                (
+                    map_key, keyword, city,
+                    json.dumps(payload, ensure_ascii=False), expires_at,
+                ),
+            )
+            cur.execute("DELETE FROM job_maps WHERE expires_at < NOW()")
+    except Exception as exc:
+        _warn(f"考点地图缓存写库失败：{exc}")
+
+
+def load_job_map(map_key: str) -> Any | None:
+    """未过期考点地图报告；过期或无行返回 None。"""
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT payload_json FROM job_maps "
+                "WHERE map_key = %s AND expires_at > NOW()",
+                (map_key,),
+            )
+            row = cur.fetchone()
+    except Exception as exc:
+        _warn(f"考点地图缓存读库失败：{exc}")
+        return None
+    return json.loads(row[0]) if row and row[0] else None
+
+
+def save_daily_practice(
+    practice_id: str, user_id: str, practice_date: str,
+    question_ids: list[str], done_ids: list[str],
+) -> None:
+    """每日一练写入/覆盖（一人一天一行；判分由 practice/submit 链路负责，此处只记进度）。"""
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO daily_practices (id, user_id, practice_date, question_ids, done_ids) "
+                "VALUES (%s, %s, %s, %s, %s) "
+                "ON DUPLICATE KEY UPDATE id = VALUES(id), question_ids = VALUES(question_ids), "
+                "done_ids = VALUES(done_ids)",
+                (
+                    practice_id, user_id, practice_date,
+                    json.dumps(question_ids, ensure_ascii=False),
+                    json.dumps(done_ids, ensure_ascii=False),
+                ),
+            )
+    except Exception as exc:
+        _warn(f"每日一练写库失败：{exc}")
+
+
+def load_daily_practice(user_id: str, practice_date: str) -> dict[str, Any] | None:
+    """当日每日一练行；无行返回 None。"""
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, question_ids, done_ids FROM daily_practices "
+                "WHERE user_id = %s AND practice_date = %s",
+                (user_id, practice_date),
+            )
+            row = cur.fetchone()
+    except Exception as exc:
+        _warn(f"每日一练读库失败：{exc}")
+        return None
+    if not row:
+        return None
+    return {
+        "id": row[0],
+        "questionIds": json.loads(row[1]) if row[1] else [],
+        "doneIds": json.loads(row[2]) if row[2] else [],
+    }
+
+
+def save_pipeline_card(card: dict[str, Any]) -> None:
+    """求职看板卡写入/覆盖（一卡一行，全量 upsert）。"""
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO job_pipeline (id, user_id, stage, security_id, keyword, job_name, "
+                "brand, city, salary, platform, match_score, set_id, interview_at, note, in_trash) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                "ON DUPLICATE KEY UPDATE stage=VALUES(stage), security_id=VALUES(security_id), "
+                "keyword=VALUES(keyword), job_name=VALUES(job_name), brand=VALUES(brand), "
+                "city=VALUES(city), salary=VALUES(salary), platform=VALUES(platform), "
+                "match_score=VALUES(match_score), set_id=VALUES(set_id), "
+                "interview_at=VALUES(interview_at), note=VALUES(note), in_trash=VALUES(in_trash)",
+                (
+                    card["id"], card["userId"], card.get("stage", "applied"),
+                    card.get("securityId", ""), card.get("keyword", ""),
+                    card.get("jobName", ""), card.get("brand", ""), card.get("city", ""),
+                    card.get("salary", ""), card.get("platform", "zhipin"),
+                    card.get("matchScore"), card.get("setId", ""),
+                    card.get("interviewAt") or None, card.get("note", ""),
+                    1 if card.get("inTrash") else 0,
+                ),
+            )
+    except Exception as exc:
+        _warn(f"求职看板写库失败：{exc}")
+
+
+def load_pipeline(user_id: str) -> list[dict[str, Any]] | None:
+    """某用户全部看板卡（含回收站）；库不可用返回 None（调用方保持内存态）。"""
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, stage, security_id, keyword, job_name, brand, city, salary, "
+                "platform, match_score, set_id, interview_at, note, in_trash, created_at "
+                "FROM job_pipeline WHERE user_id = %s ORDER BY created_at ASC",
+                (user_id,),
+            )
+            rows = cur.fetchall()
+    except Exception as exc:
+        _warn(f"求职看板读库失败：{exc}")
+        return None
+    cards: list[dict[str, Any]] = []
+    for r in rows:
+        cards.append({
+            "id": r[0],
+            "userId": user_id,
+            "stage": r[1],
+            "securityId": r[2] or "",
+            "keyword": r[3] or "",
+            "jobName": r[4] or "",
+            "brand": r[5] or "",
+            "city": r[6] or "",
+            "salary": r[7] or "",
+            "platform": r[8] or "zhipin",
+            "matchScore": r[9],
+            "setId": r[10] or "",
+            "interviewAt": r[11].strftime("%Y-%m-%d") if r[11] else "",
+            "note": r[12] or "",
+            "inTrash": bool(r[13]),
+            "createdAt": r[14].strftime("%Y-%m-%d %H:%M") if r[14] else "",
+        })
+    return cards
+
+
+def delete_pipeline_card(card_id: str) -> None:
+    """彻底删除看板卡（回收站永久删除）。"""
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM job_pipeline WHERE id = %s", (card_id,))
+    except Exception as exc:
+        _warn(f"求职看板删库失败：{exc}")

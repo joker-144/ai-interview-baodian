@@ -291,7 +291,7 @@ AI 智慧面试宝典
 #### 用户体验输出（与原型一致）
 
 - 搜索结果岗位卡：岗位名 + 橙色薪资（如 25-50K·16薪）+ 公司·城市·经验·学历 + 业务标签（B端产品/增长策略）+「生成题目」按钮；
-- 页面固定展示数据来源声明：「数据来自 Boss 直聘 · 实时检索 · 缓存 7 天」，建立透明度与信任；
+- 页面固定展示数据来源声明：「数据来自 Boss 直聘 · 实时检索 · 缓存 1 天」（V2.9 四期增补：检索缓存 TTL 由 7 天收紧为 1 天，岗位新鲜度优先；JD 详情与考点地图仍 7 天），建立透明度与信任；
 - **考点地图**："该岗位当前市场上最常被要求的 10 项技能" 可视化榜单；
 - **题库**：按「必备高频题 / 加分项题 / 差异化题」三档组织；
 - **合规说明**：boss-agent-cli 采用用户主动登录态、请求节流（高斯延迟）、结构化错误恢复，命中平台风控会停止并返回恢复指令。我们侧仅做**只读检索**，不做批量采集/打招呼等动作，频率受控。
@@ -482,7 +482,7 @@ questions(id, set_id, type, category, stem, options_json, answer,
           reference_answer, explanation, knowledge_tags, difficulty,
           resume_anchor, jd_anchor, follow_up_json, quality_score,
           embedding vector(1024))                                    -- V2.2: pgvector 去重列（HNSW 索引，cosine 距离，>0.9 丢弃）
-jobs_cache(id, security_id UNIQUE, platform, raw_json, fetched_at)   -- boss 检索缓存（V2.2: 服务端集中存储，定时任务按 TTL 7 天刷新）
+jobs_cache(id, security_id UNIQUE, platform, raw_json, fetched_at)   -- boss 检索缓存（V2.2: 服务端集中存储，定时任务按 TTL 刷新；V2.9: 检索列表 TTL 1 天）
 user_question_state(id, user_id, question_id, wrong_count, right_count,
                     last_result, next_review_at, mastered, is_favorite, note)
 exam_records(id, user_id, set_id, score, detail_json, duration_sec, created_at)
@@ -528,26 +528,50 @@ push_tokens(id, user_id, channel[miniprogram|app], token, updated_at) -- App A1 
 -- interview_turns:    (answer_id, turn_no)；agent_artifacts(cache_key) 唯一约束即缓存索引
 ```
 
-### 4.5 关键接口（V2.0 增补节选）
+### 4.5 关键接口（V2.0 增补节选；V2.7 二期落地后按实际实现修订；V2.8 三期增补以【三期】标注）
 
 | 接口 | 说明 |
 |---|---|
-| `POST /api/resumes` | 上传简历，返回解析状态（异步） |
-| `POST /api/resumes/{id}/rebuild` | 触发简历体检报告 |
-| `POST /api/resumes/{id}/optimize` | AI 一键优化简历（异步，产出新版本） |
+| `POST /api/resumes` | 上传简历并解析（同步，约 10~30s；同次产出结构化画像 + 体检 checkup）；扫描件自动转多模态 OCR |
+| `GET /api/resumes` | 简历多版本列表（version 降序，各版本挂体检报告） |
+| `GET /api/resumes/{id}/checkup` | 体检报告（旧记录缺 checkup 时惰性补算并写回；LLM 失败走规则兜底） |
+| `POST /api/resumes/{id}/optimize` | AI 一键优化简历（同步重写，生成优化版新版本 version+1、is_optimized=1；失败 502） |
+| `GET /api/resumes/{id}/download` | 导出简历 DOCX（python-docx；文件名 UTF-8 转义） |
+| `DELETE /api/resumes/{id}` | 删除一个简历版本（删最新版时出题底稿回退到次新版） |
+| `GET /api/resumes/latest` | 最新一份解析结果（出题默认用这份） |
 | `POST /api/question-sets/generate` | 触发出题，body: `{source, resume_id?, keyword?, city?, job_url?, job_image_id?, jd_text?, settings:{count, difficulty, with_answer}}`，返回 task_id |
 | `GET /api/question-sets` / `POST /api/question-sets` / `DELETE /api/question-sets/{set_id}` | 题集列表 / 用户自建题集 / 删除题集（级联清理该集训练进度与错题记录） |
 | `GET /api/question-sets/{task_id}/stream` | SSE 流式获取出题进度与增量题目 |
 | `POST /api/practice/submit` | 提交答题，判分 + 错题自动收录（答题卡模式增量提交） |
 | `GET /api/questions/{id}/site-stats` | 全站答对率 |
-| `POST /api/exams` / `POST /api/exams/{id}/submit` | 组卷 / 交卷出报告（含百分位） |
+| `POST /api/exams` | 模考组卷：抽客观题最多 40 题，限时题数×90 秒，bucket_role 取 target_role |
+| `GET /api/exams` / `GET /api/exams/{id}` | 考试历史列表 / running 记录原样返回（前端弹「恢复上次考试」） |
+| `PUT /api/exams/{id}/answer` | 单题作答增量落库（即时判分不回传对错，断网恢复基础） |
+| `POST /api/exams/{id}/pause` / `resume` / `abandon` / `submit` | 暂停（累计 paused_sec）/ 恢复 / 弃考 / 交卷判分（百分制 + 维度分 + 写站内信） |
+| `GET /api/exams/{id}/report` | 模考报告：分数/维度分/同岗位分桶百分位（样本 <5 为 null）/薄弱点 TOP5/历史趋势 |
+| `POST /api/exams/{id}/remedial` | 按薄弱知识点抽同标签题生成补强练习卷（不调 LLM） |
 | `GET /api/wrong-book` / `POST /api/wrong-book/review` | 错题本与复习 |
-| `GET /api/plans` / `POST /api/plans/generate` / `PATCH /api/plans/{task_id}` | 今日学习计划读取/生成/勾选 |
+| `GET /api/plans` | 今日学习计划；当日为空时惰性 AI 生成 3~5 项（LLM 失败降级规则模板） |
+| `POST /api/plans` / `DELETE /api/plans/{id}` | 手动添加 / 删除计划任务 |
+| `POST /api/plans/{id}/toggle` | 勾选任务；当日完成 ≥2/3 且今日未打卡时 streak+1 |
+| `GET /api/stats/week` | 本周图表：近 7 天逐日作答数柱状 + 三卡（刷题数/正确率/待复习数，answer_events 聚合） |
+| `GET /api/jobs/status` | 【三期】boss-agent-cli 探测：CLI 是否安装 + Boss 登录态（未装/未登录时前端展示扫码引导卡，仅只读检索声明） |
+| `POST /api/jobs/search` | 【三期】关键词+城市检索（boss-agent-cli 子进程，stdout JSON 信封）→ 分层采样岗位卡 ≤18（薪资带三档轮取 + 单公司 ≤2）；缓存 1 天（V2.9 四期增补调整，原 7 天；jobs_cache + 内存镜像，惰性过期刷新，读侧另按 created_at 以当前 TTL 兜底裁剪存量行）；错误分类映射：登录失效→401、风控命中→423（透传恢复指令）、超时→504、CLI 未装→503 |
+| `GET /api/jobs/{security_id}/detail` | 【三期】单岗位全量 JD（job_details 缓存 7 天；供聚合分析、检索卡「岗位要求」展开与四期增补引擎 C（子集）单岗位出题复用） |
+| `GET /api/jobs/map` | 【三期】岗位考点地图：TOP10 技能榜（含占比）+ 高频职责 + 薪资洞察 + 三档考点分布（job_maps 缓存 7 天，与生成设置解耦——设置变更只重跑出题）；未生成过 404 引导 |
+| `POST /api/question-sets/generate`（source=job_search） | 【三期/四期】引擎 B 出题通道（settings 携带 keyword/city/difficulty/withAnswer，默认题量 50）：【四期】两阶段评分漏斗——Stage1 词法预筛 top-K（无 LLM）→ 仅对 K 抓 JD 详情 → Stage2 LLM 深度评分产出 0~100 匹配分 + 理由（light 模型一次批量，失败降级词法分不阻断）→ 聚合分析仅喂 top-M（失败降级规则版词频榜）→ 三档分批出题（必备高频 50%/加分项 30%/差异化 20%）；匹配分并入 /api/jobs/map（jobScores），岗位卡展示「匹配 N%」；复用 stream/progress 与 generate_done 站内信 |
+| `POST /api/question-sets/generate`（source=jd_target） | 【四期增补】引擎 C（子集）单岗位专属出题通道（求职看板 zhipin 卡一键生成）：settings.securityId 必填（缺失 422），岗位名优先本人看板卡、回退检索缓存回填；题集按岗位名归并「{jobName} · 岗位专属预测题」（默认 30 题，显式 count 优先）；发起即挂接本人看板卡 setId（看板卡即刻显示该题集与进度）；后台取单份 JD（job_details 缓存 7 天，未命中节流抓取）→ 六维覆盖规划分批出题（复用引擎 A/B 复判/去重/落库骨架与 stream/progress、generate_done 站内信）；JD 不可得时任务降级 error，不污染看板 |
+| `GET /api/daily-practice` | 【三期】当日每日一练：首访惰性生成 10 题（薄弱知识点 60%——错题本未掌握项优先 + 其知识点关联题补足，随机 40%，不调 LLM，快照当日不变） |
+| `POST /api/daily-practice/progress` | 【三期】标记一题完成（判分走 /api/practice/submit 原链路，进度/错题/统计自然打通）；全部完成且今日未打卡 → streak+1（lastCheckinDate 同日去重） |
 | `POST /api/interview-sessions` | 创建模拟面试会话（多轮） |
 | `POST /api/interview-sessions/{id}/answers` | 提交语音转写稿，返回 STAR 实时评估与命中关键词 |
-| `GET /api/pipeline` / `POST /api/pipeline` | 求职看板列表（四列分组）/ 添加投递（可关联 question_set_id） |
-| `GET /api/reports/weekly` | 学习周报 |
-| `GET /api/notifications` / `PUT /api/notifications/{id}/read` | 通知中心 |
+| `GET /api/pipeline` / `POST /api/pipeline` | 【四期】求职看板四列列表（已投递/笔试/面试/Offer，排除回收站）+ 趋势统计（各阶段计数/本周新增/待面试/平均匹配分），GET 顺带惰性触发面试临近提醒 / 加入看板：zhipin 卡（securityId+keyword 回填岗位+匹配分+挂关键词岗位市场题集）或手动卡（外部平台降级录入） |
+| `PATCH /api/pipeline/{id}` / `DELETE /api/pipeline/{id}` | 【四期】流转阶段·改备注·设面试日期·换挂题集（仅本人卡，否则 404）/ 移入回收站（软删 in_trash=1） |
+| `GET /api/pipeline/trash` / `POST /api/pipeline/{id}/restore` / `DELETE /api/pipeline/{id}/permanent` | 【四期】回收站列表 / 还原 / 彻底删除 |
+| `GET /api/reports/weekly` | 学习周报：趋势、薄弱知识点 TOP5、下周建议（按周缓存，每周仅调一次 LLM） |
+| `GET /api/notifications` | 站内信倒序列表 + 未读数；顺带惰性补写当日复习到期汇总（当日去重） |
+| `PUT /api/notifications/{id}/read` / `PUT /api/notifications/read-all` | 单条 / 全部已读；触发源：出题完成、模考报告、复习到期汇总、面试临近提醒（interview_prep，四期） |
+| `GET /api/me/export` | 数据导出：聚合该用户全部数据为单个 JSON 下载（Content-Disposition attachment，文件名 UTF-8 转义） |
 | `PUT /api/me/settings` | 复习提醒时间等偏好（`HH:mm` 格式校验，非法 422；已注销 410） |
 | `GET /api/me` / `PUT /api/me` | 我的页一次拉齐：资料 + 三统计卡 + 我的数据计数 + 偏好 + 注销态（P13/P14）/ 更新资料（姓名、头像字、目标岗位、年限；改姓名未指定头像字则自动取首字） |
 | `DELETE /api/me` | 注销申请（写 7 天冷静期；已有申请或有进行中出题任务返回 409） |
@@ -603,7 +627,7 @@ push_tokens(id, user_id, channel[miniprogram|app], token, updated_at) -- App A1 
 |---|---|---|
 | 简历原文件 / 优化版 / 数据导出包 | 对象存储（OSS/MinIO）私有桶 + 服务端签名 URL | `resumes.file_key` 只存对象 key，禁止公网直链；注销时物理删除对象（满足 15 章数据主权承诺） |
 | LLM 结果缓存 | Redis（热，TTL 24h~7d）+ `agent_artifacts` 表（冷，长期复用） | **缓存键 = hash(模型标识 + Prompt 模板版本 + 输入内容摘要)**：简历产物挂 resume 版本号，JD 产物挂 security_id；改 Prompt 版本即整体失效，防止新旧口径混杂 |
-| JD / 岗位检索缓存 | `jobs_cache` 表（PG），定时任务按 TTL 7 天刷新 | V2.2 修正：取代 boss-agent-cli 的本地文件缓存，服务端多 worker 共享、可水平扩展 |
+| JD / 岗位检索缓存 | `jobs_cache` 表（PG），定时任务按 TTL 刷新 | V2.2 修正：取代 boss-agent-cli 的本地文件缓存，服务端多 worker 共享、可水平扩展；V2.9 四期增补：检索列表 TTL 收紧为 1 天（新鲜度优先），JD 详情 / 考点地图仍 7 天 |
 | 会话记忆（语音面试） | 会话内：LangGraph 内存态（多轮追问上下文）；会话后：`interview_answers` + `interview_turns` 持久化 | 会话结束即固化，复盘报告只读历史转写稿，不再依赖 LLM 会话内存 |
 | 用户长期画像（记忆） | **不单独建画像表，按需实时聚合** | 计划生成 / 每日一练出题时，聚合近 30 天的 `user_question_state`（薄弱点）+ `review_schedule`（到期）+ `daily_stats`（节奏）+ `job_pipeline`（面试日程），以聚合摘要作为 LLM 输入——避免维护一份易腐化的画像快照，也缩小个人数据暴露面 |
 | 答题事件明细 | `answer_events`（按月分区表） | 全站答对率、掌握度图谱、周报的唯一事实源；`site_question_stats` 是其聚合派生表，可随时全量重算 |
@@ -615,7 +639,7 @@ push_tokens(id, user_id, channel[miniprogram|app], token, updated_at) -- App A1 
 
 ## 五、合规与风险
 
-1. **BOSS 数据获取（V2.2 修正口径）**：由**平台运维受控检索账号**（只读）运行 boss-agent-cli 做低频检索，遵守其节流（高斯延迟）与风控机制；不要求用户登录 BOSS，不做批量采集、不做自动化投递/打招呼；页面固定展示数据来源声明（「数据来自 Boss 直聘 · 实时检索 · 缓存 7 天」）。产品上线前需评估平台条款风险，备好降级预案（链接/截图通道切为用户手填 + 粘贴 JD 文本通道兜底）。
+1. **BOSS 数据获取（V2.2 修正口径）**：由**平台运维受控检索账号**（只读）运行 boss-agent-cli 做低频检索，遵守其节流（高斯延迟）与风控机制；不要求用户登录 BOSS，不做批量采集、不做自动化投递/打招呼；页面固定展示数据来源声明（「数据来自 Boss 直聘 · 实时检索 · 缓存 1 天」）。产品上线前需评估平台条款风险，备好降级预案（链接/截图通道切为用户手填 + 粘贴 JD 文本通道兜底）。
 2. **简历隐私**：简历文件加密存储，解析文本脱敏后才送 LLM（姓名/电话/身份证/公司敏感信息脱敏）；一键优化产物同样受保护；提供一键删除全部数据。
 3. **生成内容准确性**：参考答案标注「AI 生成，仅供参考」；客观题双验证机制。
 4. **公司背景信息**：仅聚合公开信息，注明信息时效。
@@ -792,7 +816,15 @@ push_tokens(id, user_id, channel[miniprogram|app], token, updated_at) -- App A1 
 | P14 | 我的 / 设置（Web） | 顶栏头像进入；个人资料 + 三统计卡 + 退出登录 + 注销申请 + 复习提醒时间（一期）；学习报告 / 简历管理 / 通知管理 / 数据导出（二期） | Web | 无（V2.3 补，与 M-13 同构） |
 | A1 | 管理端 · 模型配置 | 四类分层模型 + 语音的供应商/模型名/Key/base_url/推理参数；**供应商选定即联动 base_url + 填 Key 后自动拉取可用模型（可手填）**；**本地模型区**（已下载权重清单 + 下载命令）；连通性自测；版本回滚；审计日志 | Web（仅 admin） | 无（V2.3 补，内部工具） |
 
-> **Web 端路由映射与一期实现状态（V2.5 补）**：P1 `/`、P2 `/bank`、P3 `/resume`、P4 `/jobs`、P5 `/jd`、P6 `/wrong-book`、P7 `/interview`、P8 `/pipeline`、P9 `/practice/[setId]`、P10 `/question/[id]`、P14 `/me`（一期批次项）、A1 `/admin/models`，另有登录页 `/login`。**尚未落地**：P11 模考报告、P12 简历体检报告、P13 移动端我的，以及 P14 的二期批次项（学习报告 / 简历管理 / 通知管理 / 数据导出，当前在 `/me` 以灰态 + 「二期」标记占位）。
+> **Web 端路由映射与一期实现状态（V2.5 补）**：P1 `/`、P2 `/bank`、P3 `/resume`、P4 `/jobs`、P5 `/jd`、P6 `/wrong-book`、P7 `/interview`、P8 `/pipeline`、P9 `/practice/[setId]`、P10 `/question/[id]`、P14 `/me`（一期批次项）、A1 `/admin/models`，另有登录页 `/login`。
+>
+> **二期落地状态（V2.7 补）**：P11 `/exam/report/[examId]`（含考试作答页 `/exam/[examId]`）、P12 `/resume/report`、P14 二期批次项全部上线——学习报告 `/me/report`、简历管理 `/me/resumes`、通知中心 `/me/notifications`、数据导出（`/me` 页按钮直接下载 JSON）。`/me` 内所有二期入口均已解除灰态。
+>
+> **三期落地状态（V2.8 补）**：P4 `/jobs` 上线（登录引导卡 + 检索 + 生成设置 chips + 岗位卡 + 考点地图 + 市场题库生成进度）；每日一练 `/daily`（首页卡入口，轻量逐题模式，打卡联动）。**尚未落地**：P13 移动端我的、四/五期范围（定向冲刺 / 语音面试）。
+>
+> **四期落地状态（V2.9 补）**：P8 `/pipeline` 求职看板上线（四列状态机 + 回收站软删/还原/永久删 + 趋势统计 + 手动录入外部平台 + 面试临近 interview_prep 提醒当日去重）；引擎 B 增两阶段评分漏斗（岗位卡「匹配 N%」+ 加入看板自动挂关键词定向题库并显示练习进度、去练习直达 /practice/{setId}）。新增表 job_pipeline（`_ensure_upgrade` 幂等补建）。**尚未落地**：P13 移动端我的、五期范围（JD 精准定制 / 语音面试）。
+>
+> **四期增补落地状态（V2.9 补）**：① `/jobs` 检索卡新增「岗位要求」可折叠区（单卡惰性拉 `GET /api/jobs/{security_id}/detail`，不批量抓详情，按 securityId 组件级缓存避免重请）；② 单岗位专属预测题改走求职看板（看板 zhipin 卡一键生成，复用预留 `source=jd_target`，发起即挂接卡 setId），`/jobs` 仅保留市场级（大类）生成；③ 岗位检索缓存 TTL 由 7 天收紧为 1 天（次日同词检索重拉最新岗位；JD 详情与考点地图仍 7 天）。
 
 ### 8.4 端差异化与状态同步
 

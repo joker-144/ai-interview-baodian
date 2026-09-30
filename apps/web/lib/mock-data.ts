@@ -1,5 +1,4 @@
 import type {
-  PlanTask,
   Question,
   QuestionSet,
   ResumeAnalysis,
@@ -40,29 +39,6 @@ export const DELETION_SCOPES = [
   "简历原文件与解析产物",
   "学习统计与周报数据",
 ];
-
-/** ================= 今日学习计划（原型 P1 文案） ================= */
-
-export const MOCK_PLANS: PlanTask[] = [
-  { id: "plan-1", type: "practice", title: "产品经理核心题集 · 刷 20 题", estMinutes: 15, done: true },
-  { id: "plan-2", type: "review", title: "错题复习 · 艾宾浩斯第 2 天", estMinutes: 10, done: true },
-  { id: "plan-3", type: "interview", title: "AI 模拟面试 · 行为面专场 1 场", estMinutes: 25, done: true },
-  { id: "plan-4", type: "jd_set", title: "JD 定制题集 · 字节跳动后端岗", estMinutes: 20, done: false },
-  { id: "plan-5", type: "resume_check", title: "简历体检 · 查看 AI 优化建议", estMinutes: 5, done: false },
-];
-
-/** 本周学习柱状图（周一~周日，周六最高，合计 128） */
-export const MOCK_WEEK_BARS = [
-  { day: "一", value: 15 },
-  { day: "二", value: 18 },
-  { day: "三", value: 12 },
-  { day: "四", value: 20 },
-  { day: "五", value: 16 },
-  { day: "六", value: 32 },
-  { day: "日", value: 15 },
-];
-
-export const MOCK_WEEK_STATS = { answered: 128, correctRate: 76, pendingReview: 23 };
 
 /** ================= 题集（原型 P2 文案） ================= */
 

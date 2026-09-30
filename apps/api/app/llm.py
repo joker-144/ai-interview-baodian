@@ -126,14 +126,15 @@ async def chat(layer: str, messages: list[dict[str, Any]], **kwargs: Any) -> str
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.S)
 
 
-def _strip_fence(text: str) -> str:
+def strip_fence(text: str) -> str:
+    """剥离 ```json 围栏（公开给业务侧复用）。"""
     match = _FENCE_RE.search(text)
     return (match.group(1) if match else text).strip()
 
 
 def _first_json(text: str) -> Any:
     """容错解析：优先整体解析，失败则截取首个 JSON 对象/数组。"""
-    cleaned = _strip_fence(text)
+    cleaned = strip_fence(text)
     try:
         return json.loads(cleaned)
     except ValueError:

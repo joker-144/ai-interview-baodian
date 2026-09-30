@@ -4,7 +4,7 @@
  * 我的 / 设置（P14 一期最小版，产品文档 6.2 一期范围、8.3 页面清单）
  *
  * 一期落地：个人资料、三统计卡、复习提醒时间、退出登录、注销申请（7 天冷静期 + 数据清理）。
- * 二期补齐：学习报告入口、简历管理·N 份、通知管理、数据导出（与其承载功能同期上线）。
+ * 二期补齐：学习报告、简历管理、通知管理、数据导出均已上线（随批次分批开放）。
  * 注销是第五章合规「提供一键删除全部数据」的兑现入口，故不可后置到二期。
  */
 
@@ -14,6 +14,7 @@ import { useCallback, useEffect, useState } from "react";
 import {
   cancelDeactivation,
   executeDeactivation,
+  exportMyData,
   getMe,
   isLoggedIn,
   logout,
@@ -24,14 +25,6 @@ import {
 import { PageHeader, StatCard } from "@/components/ui";
 import { DELETION_SCOPES } from "@/lib/mock-data";
 import type { MeProfile } from "@/lib/types";
-
-/** 二期项：只列出入口与说明，不做空壳页面 */
-const PHASE2_ITEMS = [
-  { label: "学习报告", desc: "周报与能力趋势入口" },
-  { label: "简历管理", desc: "多份简历与各版本体检报告" },
-  { label: "通知管理", desc: "站内信与浏览器通知偏好" },
-  { label: "数据导出", desc: "导出个人数据副本" },
-];
 
 export default function MePage() {
   const router = useRouter();
@@ -365,22 +358,53 @@ export default function MePage() {
         </p>
       </section>
 
-      {/* 二期入口占位：只说明不建空壳页 */}
+      {/* 更多入口：简历管理 / 学习报告 / 通知管理 / 数据导出（二期全部上线） */}
       <section className="card mb-4 p-5">
         <h2 className="text-base font-semibold">更多设置</h2>
         <div className="mt-3 grid grid-cols-1 gap-2 md:grid-cols-2">
-          {PHASE2_ITEMS.map((item) => (
-            <div
-              key={item.label}
-              className="flex items-center gap-3 rounded-btn border border-line px-3.5 py-3 opacity-70"
-            >
-              <div className="min-w-0">
-                <p className="text-sm text-ink">{item.label}</p>
-                <p className="mt-0.5 text-xs text-muted">{item.desc}</p>
-              </div>
-              <span className="tag ml-auto shrink-0 bg-line/70 text-muted">二期</span>
+          <Link
+            href="/me/resumes"
+            className="flex items-center gap-3 rounded-btn border border-line px-3.5 py-3 transition-colors hover:border-brand/40"
+          >
+            <div className="min-w-0">
+              <p className="text-sm text-ink">简历管理</p>
+              <p className="mt-0.5 text-xs text-muted">多份简历与各版本体检报告</p>
             </div>
-          ))}
+            <span className="tag ml-auto shrink-0 bg-success/10 text-success">已上线</span>
+          </Link>
+          <Link
+            href="/me/report"
+            className="flex items-center gap-3 rounded-btn border border-line px-3.5 py-3 transition-colors hover:border-brand/40"
+          >
+            <div className="min-w-0">
+              <p className="text-sm text-ink">学习报告</p>
+              <p className="mt-0.5 text-xs text-muted">周报与能力趋势入口</p>
+            </div>
+            <span className="tag ml-auto shrink-0 bg-success/10 text-success">已上线</span>
+          </Link>
+          <Link
+            href="/me/notifications"
+            className="flex items-center gap-3 rounded-btn border border-line px-3.5 py-3 transition-colors hover:border-brand/40"
+          >
+            <div className="min-w-0">
+              <p className="text-sm text-ink">通知管理</p>
+              <p className="mt-0.5 text-xs text-muted">站内信与浏览器通知偏好</p>
+            </div>
+            <span className="tag ml-auto shrink-0 bg-success/10 text-success">已上线</span>
+          </Link>
+          <button
+            onClick={() => run("export", exportMyData)}
+            disabled={busy !== null}
+            className="flex items-center gap-3 rounded-btn border border-line px-3.5 py-3 text-left transition-colors hover:border-brand/40 disabled:opacity-60"
+          >
+            <div className="min-w-0">
+              <p className="text-sm text-ink">数据导出</p>
+              <p className="mt-0.5 text-xs text-muted">
+                {busy === "export" ? "正在打包下载…" : "导出个人数据副本（JSON）"}
+              </p>
+            </div>
+            <span className="tag ml-auto shrink-0 bg-success/10 text-success">已上线</span>
+          </button>
         </div>
       </section>
 

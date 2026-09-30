@@ -13,8 +13,8 @@
 | 引擎 | 输入 | 能力 |
 |---|---|---|
 | **A · 简历智能分析** | 上传简历（PDF/Word/图片/文本） | 六维覆盖矩阵（技能八股/项目深挖/场景设计/行为面试/HR 综合/压力陷阱）出题，每题可溯源简历原文，附能力维度评估与简历体检报告 |
-| **B · 岗位方向检索** | 岗位关键词 + 城市 | 基于 [boss-agent-cli](https://github.com/can4hou6joeng4/boss-agent-cli)（MCP 接入）采样 15~20 个真实在招岗位，聚合市场考点，生成「必备高频 / 加分项 / 差异化」三档题库 |
-| **C · JD 精准定制** | 岗位链接 / 截图 / 粘贴文本 | 抓取 JD + 公司背景，与简历交叉生成定向冲刺包，含**岗位匹配度报告**（强匹配 / 弱匹配补强 / 缺口应对话术） |
+| **B · 岗位方向检索** | 岗位关键词 + 城市 | 基于 [boss-agent-cli](https://github.com/can4hou6joeng4/boss-agent-cli)（CLI 子进程接入）检索真实在招岗位，分层采样 ≤18 个（薪资带三档轮取 + 单公司 ≤2），**两阶段评分漏斗**（Stage1 词法预筛 top-K → 仅对 K 抓 JD 详情 → Stage2 LLM 深度评分产出 0~100 匹配分，岗位卡展示「匹配 N%」，失败降级词法分），聚合市场考点地图（TOP10 技能榜 + 薪资洞察），生成「必备高频 / 加分项 / 差异化」三档题库 |
+| **C · JD 精准定制** | 求职看板 zhipin 卡（已检索 JD）；规划中：岗位链接 / 截图 / 粘贴文本 | **单岗位专属预测题（看板一键生成，已落地子集）**：基于该岗位单份 JD 六维覆盖预测面试问题（source=jd_target），题集自动挂接看板卡并显示练习进度；规划中：链接/截图/粘贴文本通道 + 与简历交叉的**岗位匹配度报告**（强匹配 / 弱匹配补强 / 缺口应对话术） |
 
 ### 结构化题库训练体验
 
@@ -22,9 +22,14 @@
 - 刷题模式：专项 / 顺序 / 随机 / 背题 / 攻克难题 / 限时模拟考试
 - 答题卡交互、全站答对率、解析与参考回答双栏
 - **错题本**：错因三分法 + 艾宾浩斯五档复习曲线（1/2/4/7/15 天），连对 3 次毕业
-- 今日学习计划、连续打卡 streak、学习周报、知识点掌握度图谱
+- **每日一练**：当日首访惰性生成 10 题（薄弱知识点 60% + 随机 40%，不调 LLM），全完成自动计入打卡 streak
+- 今日学习计划：当日为空时 AI 惰性生成 3~5 项，打卡 streak、手动增删
+- 本周图表与统计三卡、学习周报（趋势 / 薄弱知识点 TOP5 / AI 下周建议）
+- **模拟考试**：限时组卷、断网恢复（答题增量落库）、模考报告含同岗位分桶百分位与一键补强练习
+- **简历体检报告**：总分 + 亮点/待改进清单、AI 一键优化简历（多版本对比 + DOCX 下载）
+- 站内通知中心、全量数据导出（单 JSON 下载）
 - **语音模拟面试**：流式 ASR/TTS、AI 面试官多轮追问、STAR 四维实时评估、命中关键词检测
-- 求职看板：已投递 → 笔试 → 面试 → Offer 四列状态机，面试倒计时联动冲刺
+- **求职看板**：已投递 → 笔试 → 面试 → Offer 四列状态机 + 回收站 + 趋势统计；岗位检索「加入看板」自动带入匹配分并挂接定向题库（显示练习进度、去练习直达），zhipin 卡一键生成该岗位**专属预测题**（题量/难度/附答案设置 + SSE 卡级进度，生成后自动挂接），面试日期临近联动复习提醒；纯本地状态机，不代投递 / 不打招呼 / 不监听 HR
 
 ## 技术架构
 
@@ -35,11 +40,11 @@ FastAPI + Celery + Redis              ← 异步任务 + 流式出题进度
         │
 LangGraph 出题状态机                   ← Planner → Generator×N → Critic → Verifier → Dedup
         │                                （Checkpoint 持久化 · 崩溃续跑 · 结构化输出）
-MySQL（已落地题库落库）                ← 题集 / 题目持久化；PostgreSQL + pgvector 为二期目标（复习调度 / 向量去重）
+MySQL（已落地）                          ← 题库 + 用户数据（进度/错题/简历多版本/模考/计划/通知/求职看板）持久化；连接失败自动降级内存
         │
 本地向量模型 (apps/api/models)      ← Embedding 离线推理 · 不出网不计费
         │
-boss-agent-cli (MCP)                  ← Boss 直聘只读检索 · 受控节流
+boss-agent-cli (CLI 子进程)              ← Boss 直聘只读检索 · 受控节流 · 检索缓存 1 天（JD/考点地图 7 天）
 ```
 
 设计要点：队列 + SSE 解决「出题慢」，状态机 + 答案二次验证解决「答案错」，MCP 只读检索解决「数据合规」，分层 LLM + 产物缓存解决「成本贵」；供应商以注册表管理（选定即联动 base_url，填 Key 后自动拉取可用模型，也可手填）；高频的向量调用走**项目内置本地模型**（权重入仓跟踪、克隆即用；需重新下载时执行 `python scripts/download_models.py`）。
@@ -52,7 +57,7 @@ ai-interview-baodian/
 ├── scripts/            # 模型下载脚本（download_models.py）
 ├── apps/
 │   ├── web/            # Next.js 14 前端（C 端页面 + /admin/models 管理端）
-│   ├── api/            # FastAPI 后端（引擎 A 真实链路；题库可落 MySQL）
+│   ├── api/            # FastAPI 后端（引擎 A/B 真实链路；题库可落 MySQL）
 │   │   ├── config/     # 运行期配置：llm.json（分层模型 + 混淆 Key）、db.json（MySQL 连接）
 │   │   ├── sql/        # schema.sql：题库建库脚本（手动执行一次）
 │   │   └── models/     # 本地模型权重（入仓跟踪，可用 scripts/download_models.py 重新下载）
@@ -72,6 +77,7 @@ ai-interview-baodian/
 | Node.js | 18+（实测 v24.14.0） | 必需 | Next.js 14 前端 |
 | MySQL | 8.0（用到了 JSON 类型） | 可选 | 题库持久化；**不装也能跑但重启丢数据** |
 | 云端大模型 API Key | DeepSeek / OpenAI / 通义等 | 必需 | 简历解析与出题（在管理端配置） |
+| [uv](https://docs.astral.sh/uv/) + boss-agent-cli | 最新 | 可选 | 引擎 B 岗位检索（`uv tool install boss-agent-cli`；需本机 `boss login` 扫码登录，仅只读检索） |
 
 ### 1. 安装后端依赖
 
@@ -102,7 +108,7 @@ python scripts\download_models.py     # 默认 bge-small-zh-v1.5，约 91 MB
 mysql -u root -p --default-character-set=utf8mb4 -e "source apps/api/sql/schema.sql"
 ```
 
-脚本会创建 `ai_interview_baodian` 库，共 7 张表：题库 2 张（`question_sets` / `questions`）+ 用户数据 5 张（`users` / `practice_progress` / `wrong_items` / `favorites` / `resumes`）。随后复制连接配置模板并填入你的密码：
+脚本会创建 `ai_interview_baodian` 库，共 17 张表：题库 2 张（`question_sets` / `questions`）+ 出题任务 1 张（`generate_tasks`）+ 用户数据 9 张（`users` / `practice_progress` / `answer_events` / `wrong_items` / `favorites` / `resumes` / `study_plans` / `exam_records` / `notifications`）+ 三期 4 张（`jobs_cache` / `job_details` / `job_maps` / `daily_practices`）+ 四期 1 张（`job_pipeline` 求职看板四列状态机）。全部语句为 `CREATE IF NOT EXISTS` + 容错 `ALTER`，**可重复执行**；老库直接启动时后端也会自动补建新表（`_ensure_upgrade`），无需手动迁移。随后复制连接配置模板并填入你的密码：
 
 ```powershell
 copy apps\api\config\db.json.example apps\api\config\db.json
@@ -123,7 +129,7 @@ copy apps\api\config\db.json.example apps\api\config\db.json
 ```
 
 > 模板 `db.json.example` 入仓，真实配置 `db.json` 含明文密码、已在 `.gitignore` 中忽略，不会被提交。
-> **降级行为**：不建 `db.json`、`enabled=false`、密码错误或库不存在时，后端只打印一条告警并自动退回内存模式，其余功能不受影响，只是重启后题库与用户数据（刷题进度/错题本/收藏/资料）都会回到种子态。
+> **降级行为**：不建 `db.json`、`enabled=false`、密码错误或库不存在时，后端只打印一条告警并自动退回内存模式，其余功能不受影响，只是重启后题库与用户数据（刷题进度/错题本/收藏/资料/简历/模考/计划/通知）都会回到种子态。
 > 首次启动且库中为空时仍显示演示种子题集；**一旦库中有了题集，就以库内数据为准**（种子不再出现）。
 
 ### 4. 启动后端
@@ -186,7 +192,7 @@ npm run dev
 | 启动日志出现「题库 MySQL 持久化不可用」 | MySQL 未启动 / 密码不对 / 未执行 `schema.sql`；按告警内容修正 `config/db.json`，改完重启后端 |
 | 出题报「输出被 max_tokens 截断」 | 推理型模型（如 deepseek-flash）的思考 token 会占用输出预算；在管理端调大该分层的 `maxTokens`（本项目默认已按 8192 / 12288 预留） |
 | 管理端提示未授权 / 401 | 令牌与后端 `ADMIN_TOKEN` 不一致；开发态默认 `admin-dev-token` |
-| 简历解析失败、提示疑似扫描件 | 图片型 PDF 无文字层，需换可复制文字的版本（或二期接入多模态 OCR） |
+| 简历解析失败、提示疑似扫描件 | 图片型 PDF 会自动走多模态 OCR 兜底（逐页转写），需在管理端为多模态层配好视觉模型；仍未配置或 OCR 失败时，换可复制文字的版本 |
 | Embedding 自测失败、报内存分配错误 | 本地推理线程过多；设 `LOCAL_MODEL_THREADS=1` 后重试 |
 | 重启后只看到自己生成的题集 | 正常行为：库中已有题集时以库为准，演示种子题集不再展示 |
 
@@ -198,11 +204,11 @@ npm run dev
 
 ## Roadmap
 
-- [ ] v0.1 基础训练闭环：账号 + 引擎 A + 刷题 + 错题本
-- [ ] v0.2 学习计划 + 模拟考试 + 简历体检 / AI 一键优化
-- [ ] v0.3 引擎 B（岗位检索）+ 考点地图
-- [ ] v0.4 引擎 C（JD 定向）+ 求职看板
-- [ ] v0.5 语音模拟面试（Web）
+- [x] v0.1 基础训练闭环：账号 + 引擎 A + 刷题 + 错题本
+- [x] v0.2 学习计划 + 模拟考试 + 简历体检 / AI 一键优化
+- [x] v0.3 引擎 B（岗位检索 + 考点地图）+ 每日一练（Boss 扫码登录后验证全链路真实数据）
+- [x] v0.4 求职看板（四列状态机 + 回收站 + 面试临近提醒）+ 引擎 B 两阶段匹配评分漏斗 + 单岗位专属预测题（看板一键生成，引擎 C 子集）
+- [ ] v0.5 引擎 C 完整通道（链接/截图/粘贴文本 + 岗位匹配度报告）+ 语音模拟面试（Web）
 - [ ] v1.0 小程序端
 
 ## 许可证

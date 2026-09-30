@@ -38,7 +38,7 @@ apps/api/
     └── routers/
         ├── auth.py         # 注册 / 登录（密码 + 手机验证码 + 微信，JWT）/ 我的信息
         ├── plans.py        # 今日学习计划（当日为空惰性 AI 生成 3~5 项）+ 打卡 streak
-        ├── question_sets.py # 题集 CRUD + 出题任务（三通道统一入口、SSE 流式进度）
+        ├── question_sets.py # 题集 CRUD + 出题任务（source 三通道统一入口：简历 / 岗位市场 / 单岗位定向；SSE 流式进度）
         ├── questions.py    # 题目查询 / 全站答对率（低样本保护）
         ├── practice.py     # 刷题进度 / 提交判分（错题自动收录 + answer_events）/ 收藏
         ├── wrong_book.py   # 错题本 / 艾宾浩斯复习
@@ -95,7 +95,7 @@ python scripts/download_models.py --model bge-large-zh-v1.5 --source modelscope
 | GET / POST | /api/question-sets | 题集列表 / 新建题集 |
 | GET / DELETE | /api/question-sets/{set_id} | 题集详情 / 删除题集（级联清理进度与错题） |
 | GET | /api/question-sets/{set_id}/questions | 题集内题目 |
-| POST | /api/question-sets/generate | 触发出题（三通道统一入口，body: `{source, resumeId?, settings:{count, difficulty, with_answer}}`） |
+| POST | /api/question-sets/generate | 触发出题（统一入口，body: `{source, resumeId?, settings:{count, difficulty, with_answer}}`；`source` 三通道 = `resume` 简历驱动 / `job_search` 岗位市场级 / `jd_target` 单岗位专属。注：此处「三通道」指**出题来源**，与引擎 C 的**输入**三通道（粘贴链接 / 上传截图 / 粘贴文本）不是同一概念，后者属五期未实现） |
 | GET | /api/question-sets/{task_id}/stream | SSE 流式出题进度（观察者，断开不影响生成） |
 | GET | /api/question-sets/{task_id}/progress | 轮询兜底 |
 | GET | /api/questions | 题目列表（按 setId 过滤） |
@@ -180,6 +180,8 @@ python scripts/download_models.py --model bge-large-zh-v1.5 --source modelscope
 >
 > 接口命名已与文档 4.5 对齐：出题统一走 `POST /api/question-sets/generate`（`source` 区分简历 / 岗位检索 / JD 定向三通道），
 > 题集 CRUD 在 `/api/question-sets`，题目与全站统计在 `/api/questions`。
+> 其中 `source=jd_target`（JD 定向）四期增补只落地「**已检索 JD**」这一条输入路径（看板 zhipin 卡一键生成）；
+> 引擎 C 的完整输入三通道与岗位匹配度报告顺延至五期，见下「分期落地状态」。
 >
 > **二期新增能力**：学习计划（`/api/plans`，惰性 AI 生成 + 打卡）、周报（`/api/reports/weekly`）、模拟考试（`/api/exams` 全套）、
 > 简历多版本 + 体检 + AI 优化 + DOCX 下载（`/api/resumes*`）、站内通知（`/api/notifications`）、数据导出（`/api/me/export`）。
@@ -188,7 +190,8 @@ python scripts/download_models.py --model bge-large-zh-v1.5 --source modelscope
 >
 > **三期新增能力（引擎 B 岗位市场 + 每日一练）**：岗位检索（`/api/jobs/*`）、引擎 B 出题通道（generate source=job_search）、
 > 考点地图（`/api/jobs/map`）、每日一练（`/api/daily-practice*`）。新增表 `jobs_cache` / `job_details` / `job_maps` / `daily_practices`，
-> 均由 `_ensure_upgrade` 幂等补建；三层缓存 TTL 7 天惰性过期刷新（无定时器），内存镜像 + MySQL 回源双模式。
+> 均由 `_ensure_upgrade` 幂等补建；三层缓存惰性过期刷新（无定时器），内存镜像 + MySQL 回源双模式；
+> TTL 口径见下「缓存 TTL 口径」（四期增补调整后：检索列表 1 天，JD 详情 / 考点地图 7 天）。
 >
 > **四期新增能力（求职看板 + 引擎 B 两阶段评分漏斗）**：求职看板（`/api/pipeline*`：四列状态机 / 回收站 / 趋势统计 / 面试临近提醒）、
 > 引擎 B 两阶段漏斗（生成 source=job_search 时 Stage1 词法预筛 top-K → Stage2 LLM 深度评分产出匹配分，失败降级词法分不阻断）。
@@ -200,6 +203,28 @@ python scripts/download_models.py --model bge-large-zh-v1.5 --source modelscope
 > （单卡惰性拉取 `/api/jobs/{security_id}/detail`，不批量抓详情，规避限流/风控）；检索列表出参补 `description` 字段（无则为空串）。
 > 无新增表，出题骨架复用引擎 A/B（六维规划 + 复判 + 去重 + SSE 进度）；单岗位出题依赖同一 Boss 环境（专用 Chrome CDP + 登录态），
 > 未就绪时任务降级报错引导，看板手动流转与手动录入不受影响。
+>
+> **范围边界（对齐产品文档第六章 V2.10 排期口径）**：四期实际交付 = 引擎 B 两阶段匹配评分漏斗 + 求职看板四列状态机 + **引擎 C 子集**（仅「已检索 JD」一条输入路径）。
+> 原挂在四期的「引擎 C 完整三通道（粘贴 BOSS 链接 / 上传岗位截图 / 粘贴 JD 文本）+ 岗位匹配度报告（JD×简历 匹配分 + 强/弱匹配 + 缺口→补强突击题包）+ 『结合我的简历生成』开关 + 掌握度图谱」
+> **已整体顺延至五期，后端当前未实现**（无对应路由与表；前端 `apps/web/app/jd/page.tsx` 仅为 `ComingSoon` 占位页，已标注「Web 五期 W14~W15」）；拆段理由与处置建议见文档 6.2 / 6.5 第 7 条。
+
+## 分期落地状态（对齐产品文档第六章 V2.10）
+
+| 期次 | 后端交付内容 | 状态 |
+|---|---|---|
+| 一期 W1~W4 | 账号体系（密码 / 手机验证码 / 微信登录，JWT）、引擎 A（简历上传解析 + 能力维度评估 + 流式出题）、题集 / 题目 CRUD、刷题判分 + 错题自动收录、错题本（错因三分法 + 艾宾浩斯队列）、题目详情 + 收藏、全站答对率（低样本保护）、我的页最小版 `/api/me`（资料 + 注销冷静期）、**管理端分层模型配置** `/api/admin/*`（`config/llm.json` 落盘 + 供应商联动 + 模型发现 + 连通性自测 + 审计 + 回滚）、**本地向量模型离线推理**（`models/` 入仓 + 懒加载单例） | ✅ 已交付 |
+| 二期 W5~W7 | 学习计划 + 打卡 streak（`/api/plans*`）、本周统计三卡 + 近 7 天柱状（`/api/stats/week`）、模拟考试全套（组卷 / 增量落库 / 暂停恢复 / 判分 / 报告 / 补强）、简历多版本 + 体检报告 + AI 一键优化 + DOCX 导出、学习周报（页面 `/me/report` + 接口 `/api/reports/weekly`）、站内通知中心（`/api/notifications`）、数据导出（`/api/me/export`） | ✅ 已交付 |
+| 三期 W8~W10 | 引擎 B 岗位市场（boss-agent-cli 只读检索 + 分层采样 + 异常矩阵映射）、考点地图 `/api/jobs/map`、每日一练、`generate source=job_search`、三层缓存（`jobs_cache` / `job_details` / `job_maps`） | ✅ 已交付 |
+| 四期 W11~W13 | 引擎 B **两阶段匹配评分漏斗**（Stage1 词法预筛 top-K 无 LLM → 仅对 K 抓 JD 详情 → Stage2 LLM 产出 0~100 匹配分 + 理由，失败降级词法分不阻断；匹配分并入考点地图 `jobScores` 并回填看板卡）、求职看板 `/api/pipeline*`（四列状态机 / 回收站 / 趋势统计 / 面试临近提醒）、**引擎 C 子集** `generate source=jd_target`（单岗位专属预测题，看板一键生成 + 发起即挂接卡 setId）、检索卡「岗位要求」可折叠区、检索缓存 TTL 收紧为 1 天 | ✅ 已交付（引擎 C 仅子集） |
+| 五期 W14~W15 | Web 语音模拟面试（WebSocket 流式 ASR/TTS + STAR 四维评估 + 复盘报告 + 文字降级）、**引擎 C 完整三通道**（粘贴链接解析 security_id / 上传截图多模态解析 / 粘贴文本 LLM 结构化，复用同一 `source=jd_target` 并在 settings 增 `inputChannel` 分派）、**岗位匹配度报告**、**「结合我的简历生成」开关**、**掌握度图谱** | ⬜ 未开始 |
+| App A1~A3 W16~W22 | 小程序 / 移动端（复用本 API，不新增后端能力） | ⬜ 未开始 |
+
+> **口径不得混用**：`/api/jobs/map` 返回的 `jobScores`（`{securityId: {score, reason}}`）是**引擎 B 的市场级**匹配分——按「关键词 + 城市」批量评分、用于岗位卡「匹配 N%」与看板回填；
+> 五期「岗位匹配度报告」是**单岗位 JD×简历**的逐条强匹配 / 弱匹配 / 缺口三分类 + 缺口题包，产物模型与展示页均需新建，二者不是同一东西，接口与文档表述都不得互相替代。
+>
+> **五期可复用点（已就绪）**：`generate` 的 `source=jd_target` 出题骨架（六维规划 + 复判 + 去重 + 落库 + SSE 进度）、题集按岗位名归并、看板卡 setId 挂接口径、`job_details` 单卡惰性抓取与 7 天缓存、notifications 站内信机制。
+> **五期需新建（当前不存在）**：语音链路（ASR/TTS/评估）、图片上传与多模态解析、`inputChannel` 分派、匹配度报告产物模型与表、掌握度图谱聚合。
+> 注：`app/models.py` 里的 `follow_up_json` / `resume_anchor` / `jd_anchor` 等列属 SQLAlchemy **预留定义**（该文件未参与实际建表，真实 DDL 在 `sql/schema.sql`），不可当作已落地能力引用。
 
 ## 岗位检索环境准备（三期，引擎 B）
 

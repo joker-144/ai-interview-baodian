@@ -18,6 +18,12 @@ import type {
   ExamReport,
   ExamState,
   GenerateProgress,
+  InterviewAnswerResult,
+  InterviewCapabilities,
+  InterviewListItem,
+  InterviewMode,
+  InterviewReportPayload,
+  InterviewSession,
   DailyPractice,
   DailyProgressResult,
   JobCard,
@@ -861,4 +867,139 @@ export async function purgePipelineCard(cardId: string): Promise<void> {
   await apiFetch<{ ok: boolean }>(`/api/pipeline/${encodeURIComponent(cardId)}/permanent`, {
     method: "DELETE",
   });
+}
+
+/* ---------------- 语音模拟面试（五期，文档 3.9） ---------------- */
+
+/** 二进制响应封装（TTS 音频 / 录音回放）：带 JWT 拉 Blob，错误体仍走后端 detail 直出 */
+async function apiFetchBlob(path: string, init?: RequestInit, errPrefix = "请求"): Promise<Blob> {
+  const auth = read<StoredAuth | null>(LS.auth, null);
+  const authHeaders: Record<string, string> = auth?.token
+    ? { Authorization: `Bearer ${auth.token}` }
+    : {};
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE}${path}`, {
+      ...init,
+      headers: { "Content-Type": "application/json", ...authHeaders, ...(init?.headers ?? {}) },
+    });
+  } catch {
+    throw new Error("无法连接后端服务（apps/api，默认 8000 端口），请确认服务已启动");
+  }
+  if (!res.ok) {
+    let message = `${errPrefix}失败（HTTP ${res.status}）`;
+    try {
+      const body = (await res.json()) as { detail?: unknown };
+      if (typeof body.detail === "string") message = body.detail;
+    } catch {
+      // 非 JSON 错误体时用状态码描述
+    }
+    throw new Error(message);
+  }
+  return res.blob();
+}
+
+/** 语音能力探测：asrAvailable=false → 降级文字输入；ttsAvailable=false → 不展示读题 */
+export async function getInterviewCapabilities(): Promise<InterviewCapabilities> {
+  return apiFetch<InterviewCapabilities>("/api/interview-sessions/capabilities");
+}
+
+/** 历史面试列表（倒序；据此展示「查看复盘 / 继续」入口） */
+export async function getInterviewSessions(): Promise<InterviewListItem[]> {
+  return apiFetch<InterviewListItem[]>("/api/interview-sessions");
+}
+
+/** 创建面试会话：后端按「目标岗位 + 简历」实时动态出题（数秒），返回整场题目 */
+export async function createInterviewSession(params: {
+  mode: InterviewMode;
+  targetJob: string;
+  count: number;
+  recordAudio: boolean;
+}): Promise<InterviewSession> {
+  return post<InterviewSession>("/api/interview-sessions", params);
+}
+
+/** 取会话现场（刷新 / 断网恢复：题目 + 已答明细原样回填） */
+export async function getInterviewSession(sessionId: string): Promise<InterviewSession> {
+  return apiFetch<InterviewSession>(`/api/interview-sessions/${encodeURIComponent(sessionId)}`);
+}
+
+/** 题目/追问文字 → 面试官语音（云端 Qwen3-TTS），返回可播放 WAV Blob */
+export async function synthesizeInterviewTts(
+  sessionId: string,
+  params: { seq?: number; text?: string },
+): Promise<Blob> {
+  return apiFetchBlob(
+    `/api/interview-sessions/${encodeURIComponent(sessionId)}/tts`,
+    { method: "POST", body: JSON.stringify({ seq: params.seq ?? -1, text: params.text ?? "" }) },
+    "语音合成",
+  );
+}
+
+/** 提交单题作答：有 file 走后端 ASR 转写；无 file 只传 transcript（文字降级）→ light 层即时评分 */
+export async function submitInterviewAnswer(
+  sessionId: string,
+  input: { seq: number; file?: Blob; transcript?: string; durationSec?: number; retainAudio?: boolean },
+): Promise<InterviewAnswerResult> {
+  const form = new FormData();
+  form.append("seq", String(input.seq));
+  if (input.file) form.append("file", input.file, `answer-${input.seq}.wav`);
+  form.append("transcript", input.transcript ?? "");
+  form.append("durationSec", String(input.durationSec ?? 0));
+  form.append("retainAudio", input.retainAudio === false ? "false" : "true");
+  return apiFetch<InterviewAnswerResult>(
+    `/api/interview-sessions/${encodeURIComponent(sessionId)}/answers`,
+    { method: "POST", body: form },
+  );
+}
+
+/** 提交一层追问的作答（录音或文字），存为候选人轮次 */
+export async function submitInterviewFollowup(
+  sessionId: string,
+  answerId: string,
+  input: { file?: Blob; transcript?: string; durationSec?: number; retainAudio?: boolean },
+): Promise<{ ok: boolean; seq: number; transcript: string }> {
+  const form = new FormData();
+  if (input.file) form.append("file", input.file, `followup-${answerId}.wav`);
+  form.append("transcript", input.transcript ?? "");
+  form.append("durationSec", String(input.durationSec ?? 0));
+  form.append("retainAudio", input.retainAudio === false ? "false" : "true");
+  return apiFetch<{ ok: boolean; seq: number; transcript: string }>(
+    `/api/interview-sessions/${encodeURIComponent(sessionId)}/answers/${encodeURIComponent(answerId)}/followup`,
+    { method: "POST", body: form },
+  );
+}
+
+/** 结束面试：primary 层生成复盘报告（四维雷达 + 总评 + 改进建议） */
+export async function finishInterview(sessionId: string): Promise<InterviewReportPayload> {
+  return post<InterviewReportPayload>(
+    `/api/interview-sessions/${encodeURIComponent(sessionId)}/finish`,
+  );
+}
+
+/** 读复盘报告（含每题文字稿与追问轮次） */
+export async function getInterviewReport(sessionId: string): Promise<InterviewReportPayload> {
+  return apiFetch<InterviewReportPayload>(
+    `/api/interview-sessions/${encodeURIComponent(sessionId)}/report`,
+  );
+}
+
+/** 录音回放：仅本人、仅开启留存时；返回 WAV Blob（供 <audio> 播放） */
+export async function fetchInterviewAudio(
+  sessionId: string,
+  answerId: string,
+): Promise<Blob> {
+  return apiFetchBlob(
+    `/api/interview-sessions/${encodeURIComponent(sessionId)}/answers/${encodeURIComponent(answerId)}/audio`,
+    undefined,
+    "录音获取",
+  );
+}
+
+/** 删除面试会话（连带作答/追问/录音）；合规「可删」口径 */
+export async function deleteInterviewSession(sessionId: string): Promise<void> {
+  await apiFetch<{ ok: boolean }>(
+    `/api/interview-sessions/${encodeURIComponent(sessionId)}`,
+    { method: "DELETE" },
+  );
 }

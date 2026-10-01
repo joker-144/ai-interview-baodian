@@ -28,21 +28,23 @@
 - **模拟考试**：限时组卷、断网恢复（答题增量落库）、模考报告含同岗位分桶百分位与一键补强练习
 - **简历体检报告**：总分 + 亮点/待改进清单、AI 一键优化简历（多版本对比 + DOCX 下载）
 - 站内通知中心、全量数据导出（单 JSON 下载）
-- **语音模拟面试**：流式 ASR/TTS、AI 面试官多轮追问、STAR 四维实时评估、命中关键词检测
+- **语音模拟面试**（五期已交付）：**本地 SenseVoice 离线 ASR**（录完即传、秒级转写、音频不出网）+ **云端 Qwen3-TTS-Flash 实时合成面试官声音**；题目按简历+岗位动态生成（不落题库），STAR 四维实时评估 + 命中关键词检测 + AI 面试官一层追问 + 四维雷达复盘；录音逐场显式开启（默认不留存、可回放可删）；无麦克风/弱网/ASR 未下载自动降级文字输入
 - **求职看板**：已投递 → 笔试 → 面试 → Offer 四列状态机 + 回收站 + 趋势统计；岗位检索「加入看板」自动带入匹配分并挂接定向题库（显示练习进度、去练习直达），zhipin 卡一键生成该岗位**专属预测题**（题量/难度/附答案设置 + SSE 卡级进度，生成后自动挂接），面试日期临近联动复习提醒；纯本地状态机，不代投递 / 不打招呼 / 不监听 HR
 
 ## 技术架构
 
 ```
 Next.js (Web) + Taro (小程序)          ← 双端同构，同一套 API
-        │ HTTPS / SSE / WebSocket
+        │ HTTPS / SSE（出题进度流式）
 FastAPI + Celery + Redis              ← 异步任务 + 流式出题进度
         │
 LangGraph 出题状态机                   ← Planner → Generator×N → Critic → Verifier → Dedup
         │                                （Checkpoint 持久化 · 崩溃续跑 · 结构化输出）
-MySQL（已落地）                          ← 题库 + 用户数据（进度/错题/简历多版本/模考/计划/通知/求职看板）持久化；连接失败自动降级内存
+MySQL（已落地）                          ← 题库 + 用户数据（进度/错题/简历多版本/模考/计划/通知/求职看板/语音面试）持久化；连接失败自动降级内存
         │
-本地向量模型 (apps/api/models)      ← Embedding 离线推理 · 不出网不计费
+本地模型 (apps/api/models)          ← Embedding + SenseVoice ASR 离线推理 · 不出网不计费
+        │
+云端 Qwen3-TTS-Flash (DashScope)       ← 面试题目语音实时合成（非流式、同源回传）
         │
 boss-agent-cli (CLI 子进程)              ← Boss 直聘只读检索 · 受控节流 · 检索缓存 1 天（JD/考点地图 7 天）
 ```
@@ -90,8 +92,9 @@ python -m pip install -r requirements.txt
 
 > `requirements.txt` 里注释掉了 `uvicorn[standard]`（Python 3.14 下 httptools 无预编译包），装普通 `uvicorn` 即可。
 > `sentence-transformers` 会连带安装 torch，体积较大且只在本地跑 Embedding 时需要；若 Embedding 层改用云端，可先跳过它。
+> **`sherpa-onnx`（五期本地 ASR 依赖）必须走官方 PyPI 源**（`python -m pip install sherpa-onnx --index-url https://pypi.org/simple`），清华等国内镜像无此包会装不上。
 
-### 2. 下载本地向量模型（Embedding 层默认离线推理）
+### 2. 下载本地模型（Embedding 向量模型 + SenseVoice 语音 ASR）
 
 ```powershell
 cd ..\..                              # 回到仓库根目录
@@ -99,6 +102,14 @@ python scripts\download_models.py     # 默认 bge-small-zh-v1.5，约 91 MB
 ```
 
 权重落在 `apps/api/models/`，且**已入仓跟踪**，正常克隆后已存在，仅在缺失时才需执行。
+
+五期语音面试的**本地 ASR（SenseVoice-Small int8）**需单独下载（约 228 MB，走 GitHub release 的 `.tar.bz2`，脚本会解压后仅保留 `model.int8.onnx` / `tokens.txt`）：
+
+```powershell
+python scripts\download_models.py --model sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17
+```
+
+下载后管理端「本地模型」区会列出该 ASR 权重（`kind=asr`，离线、无需 Key）；**未下载时语音面试自动降级为文字输入模式**，其余功能不受影响。
 
 ### 3. 初始化 MySQL 题库表（可选，推荐）
 
@@ -108,7 +119,7 @@ python scripts\download_models.py     # 默认 bge-small-zh-v1.5，约 91 MB
 mysql -u root -p --default-character-set=utf8mb4 -e "source apps/api/sql/schema.sql"
 ```
 
-脚本会创建 `ai_interview_baodian` 库，共 17 张表：题库 2 张（`question_sets` / `questions`）+ 出题任务 1 张（`generate_tasks`）+ 用户数据 9 张（`users` / `practice_progress` / `answer_events` / `wrong_items` / `favorites` / `resumes` / `study_plans` / `exam_records` / `notifications`）+ 三期 4 张（`jobs_cache` / `job_details` / `job_maps` / `daily_practices`）+ 四期 1 张（`job_pipeline` 求职看板四列状态机）。全部语句为 `CREATE IF NOT EXISTS` + 容错 `ALTER`，**可重复执行**；老库直接启动时后端也会自动补建新表（`_ensure_upgrade`），无需手动迁移。随后复制连接配置模板并填入你的密码：
+脚本会创建 `ai_interview_baodian` 库，共 20 张表：题库 2 张（`question_sets` / `questions`）+ 出题任务 1 张（`generate_tasks`）+ 用户数据 9 张（`users` / `practice_progress` / `answer_events` / `wrong_items` / `favorites` / `resumes` / `study_plans` / `exam_records` / `notifications`）+ 三期 4 张（`jobs_cache` / `job_details` / `job_maps` / `daily_practices`）+ 四期 1 张（`job_pipeline` 求职看板四列状态机）+ 五期 3 张（`interview_sessions` / `interview_answers` / `interview_turns` 语音面试）。全部语句为 `CREATE IF NOT EXISTS` + 容错 `ALTER`，**可重复执行**；老库直接启动时后端也会自动补建新表（`_ensure_upgrade`），无需手动迁移。随后复制连接配置模板并填入你的密码：
 
 ```powershell
 copy apps\api\config\db.json.example apps\api\config\db.json
@@ -158,8 +169,9 @@ npm run dev
 
 1. 打开 http://localhost:3000/admin/models ；
 2. 输入管理端令牌，开发态默认 **`admin-dev-token`**（对应后端环境变量 `ADMIN_TOKEN`，生产必须改）；
-3. 按分层配置：`主模型 / 轻量模型 / 多模态` 填云端 API Key（如 DeepSeek，选定供应商后 `baseUrl` 会自动回填），`Embedding` 直接选「本地模型（项目内置）」，`语音` 一期可停用；
-4. 每层点「测试连接」确认可通。Embedding 层的自测是**真实推理**，会校验同义句与无关句的相似度区分度。
+3. 按分层配置：`主模型 / 轻量模型 / 多模态` 填云端 API Key（如 DeepSeek，选定供应商后 `baseUrl` 会自动回填），`Embedding` 直接选「本地模型（项目内置）」；
+4. **`语音（voice）` 层（五期面试 TTS）**：供应商与模型名已**锁定为「阿里云百炼 / qwen3-tts-flash」**（只读，不需选择），只需填入百炼 DashScope API Key（Key 输入框下方有「获取 API Key →」链接，新窗口打开 [阿里百炼控制台](https://help.aliyun.com/zh/model-studio/get-api-key)，新用户送 11 万字符额度），音色可下拉切换（默认 Andre）；**未配 Key 时面试读题会报可读错误，但不影响文字模式作答**；ASR（本地 SenseVoice）离线、无需 Key；
+5. 每层点「测试连接」确认可通。Embedding 层的自测是**真实推理**，会校验同义句与无关句的相似度区分度。
 
 配置落盘在 `apps/api/config/llm.json`（Key 为 XOR+base64 **混淆**存储、接口只回显掩码，该文件已在 `.gitignore` 中）。文件缺失时会自动从同目录模板 `llm.json.example` 复制生成。
 
@@ -181,6 +193,9 @@ npm run dev
 | `KEY_SECRET` | `aib-dev-key-secret-change-me` | API Key 混淆密钥；一期为 XOR+base64（非加密），生产需换 KMS / Fernet |
 | `CORS_ORIGINS` | `http://localhost:3000,http://127.0.0.1:3000` | 前端来源白名单（逗号分隔） |
 | `LOCAL_MODEL_THREADS` | `2` | 本地推理线程数；容器 / 低内存环境调低可避免 OpenBLAS 分配失败 |
+| `ASR_THREADS` | `4` | 本地 ASR（SenseVoice）推理线程数；4 线程实测约 22 倍实时 |
+| `ASR_MODEL_ID` | `sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17` | 本地 ASR 模型 id（`apps/api/models/<id>/`） |
+| `RECORDINGS_DIR` | `apps/api/recordings` | 面试录音留存目录（仅逐场显式开启才落盘，已 gitignored；DB 只存相对路径） |
 
 完整清单与接口列表见 [apps/api/README.md](./apps/api/README.md)。
 
@@ -201,6 +216,7 @@ npm run dev
 - Boss 直聘数据仅通过用户授权的低频**只读检索**获取（boss-agent-cli），不做批量采集与自动化投递；
 - 简历等个人数据脱敏后才送 LLM，支持一键导出与彻底删除（账号注销入口在「我的」页：二次确认并逐条明示删除范围 → 7 天冷静期可撤回 → 到期清理不可逆）；
 - AI 生成的参考答案标注「仅供参考」，客观题采用双模型交叉验证。
+- 语音面试：麦克风始终采集仅用于**本地 SenseVoice 离线转写**（音频不出网），默认不留存、转写后即弃；录音回放为**逐场显式开启**（开启才落盘、可回放可删、仅本人可访问），随会话删除 / 账号注销级联清除。
 
 ## Roadmap
 
@@ -208,7 +224,8 @@ npm run dev
 - [x] v0.2 学习计划 + 模拟考试 + 简历体检 / AI 一键优化
 - [x] v0.3 引擎 B（岗位检索 + 考点地图）+ 每日一练（Boss 扫码登录后验证全链路真实数据）
 - [x] v0.4 求职看板（四列状态机 + 回收站 + 面试临近提醒）+ 引擎 B 两阶段匹配评分漏斗 + 单岗位专属预测题（看板一键生成，引擎 C 子集）+ 检索卡「岗位要求」+ 检索缓存 TTL 收紧为 1 天
-- [ ] v0.5 语音模拟面试（Web）+ 引擎 C 完整三通道（链接 / 截图 / 粘贴文本）+ 岗位匹配度报告（含「结合我的简历生成」开关与缺口题包）+ 掌握度图谱（自 v0.4 顺延，范围加重，处置建议见产品文档 6.2）
+- [x] v0.5 语音模拟面试（Web）：本地 SenseVoice 离线 ASR + 云端 Qwen3-TTS-Flash 实时合成 + 动态出题 + STAR 四维评估 + 命中关键词 + 一层追问 + 四维雷达复盘 + 录音逐场显式开启/回放 + 无麦克风/弱网/ASR 未下载降级文字
+- [ ] v0.6 引擎 C 完整三通道（链接 / 截图 / 粘贴文本）+ 岗位匹配度报告（含「结合我的简历生成」开关与缺口题包）（自 v0.5 拆期，掌握度图谱入产品文档 6.6 远期）
 - [ ] v1.0 小程序端
 
 ## 许可证

@@ -35,6 +35,9 @@ Thumbs.db
 *.log
 uploads/
 
+# 面试录音留存（五期）：仅「逐场显式开启」才落盘，绝不入仓（合规：默认不留存、可回放可删）
+apps/api/recordings/
+
 # 本地模型权重：入仓跟踪（团队共享、免重复下载；用 scripts/download_models.py 拉取到 apps/api/models/）
 # 下方按扩展名全量忽略权重类文件后，再用否定规则放行项目内模型目录
 /models/
@@ -46,6 +49,10 @@ uploads/
 *.ckpt
 *.msgpack
 !apps/api/models/**
+# 例外：超过 GitHub 单文件 100MB 硬上限的权重不入仓（push 会被服务器拒绝，且不用 LFS）——
+# 改为各机器执行 scripts/download_models.py 按需拉取。SenseVoice ASR 的 model.int8.onnx 约 228MB，
+# 故在放行 models 目录后，再把其中的 .onnx 重新忽略（bge 为 .safetensors，不受影响，仍入仓共享）。
+apps/api/models/**/*.onnx
 
 # 管理端真实配置（含混淆 Key）：不入仓；仓内是同目录模板 llm.json.example（Key 全空）
 apps/api/config/llm.json

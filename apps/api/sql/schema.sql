@@ -8,6 +8,9 @@
 -- 二期（V2.7）新增：study_plans（今日学习计划）、exam_records（模拟考试）、notifications（站内通知）；users 表新增 last_checkin_date 列。
 -- 三期（V2.8）新增：jobs_cache（岗位检索缓存，四期增补起 TTL 收紧为 1 天）、job_details（JD 详情缓存）、job_maps（考点地图缓存）（后两者 TTL 7 天），均惰性过期刷新；
 --   daily_practices（每日一练，惰性 10 题 + 打卡联动）。
+-- 四期（V2.10）新增：job_pipeline（求职看板，四列状态机 + 回收站软删）。
+-- 五期（V2.11）新增：interview_sessions（语音模拟面试会话）、interview_answers（作答 + STAR 评分 + 命中关键词）、interview_turns（追问轮次）；
+--   题目按「目标岗位 + 简历」动态生成并以 JSON 快照存于会话/作答行（不入题库）；录音逐场显式开启、默认不留存、开启才落盘（仅存路径引用）。
 -- 二期（V2.7）变更：resumes 表改为多版本结构（resume_id 主键 + version 递增 + is_optimized 标记）。
 --   旧库升级：后端首次连接时自动检测旧结构并迁移（旧单行 -> version=1 的第一版），无需手工操作；
 --   若自动迁移失败，可按以下 SQL 手工执行：
@@ -305,4 +308,56 @@ CREATE TABLE IF NOT EXISTS job_pipeline (
   KEY idx_pipeline_user_stage (user_id, stage),
   KEY idx_pipeline_user_trash (user_id, in_trash)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '求职看板（四列状态机）';
+
+-- ============================================================
+-- 语音模拟面试（五期 V2.11）：题目按「目标岗位 + 简历」实时动态生成，以 JSON 快照存于会话/作答行，
+-- 不入题库（命中率低、不做预合成缓存）；录音默认不留存，仅「逐场显式开启」才落盘，DB 只存相对路径引用。
+-- 故意不加外键——与进度/错题一致，允许短暂悬挂引用，删除会话时按 session_id 显式级联清理（见 db.delete_interview_session）。
+-- ============================================================
+
+-- 面试会话：一场一行；questions_json 为整场题目快照，report_json 于 finish 后回写复盘报告。
+CREATE TABLE IF NOT EXISTS interview_sessions (
+  id             VARCHAR(64)  NOT NULL COMMENT '面试会话 id（itv-xxxxxxxx）',
+  user_id        VARCHAR(64)  NOT NULL COMMENT '所属用户（JWT sub）',
+  mode           VARCHAR(32)  NOT NULL DEFAULT 'mixed' COMMENT '面试模式：tech / behavior / hr / mixed',
+  target_job     VARCHAR(128) NOT NULL DEFAULT '' COMMENT '目标岗位',
+  questions_json JSON         NOT NULL COMMENT '动态题目快照数组（不入题库）',
+  status         VARCHAR(16)  NOT NULL DEFAULT 'running' COMMENT 'running / finished / abandoned',
+  record_audio   TINYINT(1)   NOT NULL DEFAULT 0 COMMENT '本场是否开启录音留存（逐场显式开启）',
+  report_json    JSON         NULL COMMENT '复盘报告（四维雷达 + 文字稿 + 建议），finish 后回写',
+  started_at     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '开始时间',
+  finished_at    DATETIME     NULL COMMENT '结束时间',
+  PRIMARY KEY (id),
+  KEY idx_itv_sessions_user (user_id, status)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '语音模拟面试会话（五期）';
+
+-- 面试作答：一题一行；transcript 为 ASR 转写文字稿，star_scores/hit_keywords 由 light 层即时评分回写。
+CREATE TABLE IF NOT EXISTS interview_answers (
+  id                   VARCHAR(64)  NOT NULL COMMENT '作答 id（itva-xxxxxxxx）',
+  session_id           VARCHAR(64)  NOT NULL COMMENT '所属会话 id',
+  seq                  INT          NOT NULL DEFAULT 0 COMMENT '题序（0 基）',
+  question_json        JSON         NOT NULL COMMENT '本题快照（stem/dimension/keywords/followUp/suggestSec）',
+  transcript           MEDIUMTEXT   NULL COMMENT 'ASR 转写文字稿',
+  star_scores_json     JSON         NULL COMMENT 'STAR 四维评分 0~10',
+  hit_keywords_json    JSON         NULL COMMENT '命中关键词数组',
+  missed_keywords_json JSON         NULL COMMENT '未提及关键词数组',
+  comment              TEXT         NULL COMMENT 'light 层即时点评',
+  duration_sec         INT          NOT NULL DEFAULT 0 COMMENT '作答时长（秒）',
+  recording_path       VARCHAR(500) NOT NULL DEFAULT '' COMMENT '录音文件相对路径（仅开启留存时非空）',
+  created_at           DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '提交时间',
+  PRIMARY KEY (id),
+  KEY idx_itv_answers_session (session_id, seq)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '语音模拟面试作答（五期）';
+
+-- 追问轮次：一层追问的面试官提问与候选人回答各一行（append-only）。
+CREATE TABLE IF NOT EXISTS interview_turns (
+  id          VARCHAR(64)  NOT NULL COMMENT '追问轮次 id（itvt-xxxxxxxx）',
+  answer_id   VARCHAR(64)  NOT NULL COMMENT '所属作答 id',
+  turn_no     INT          NOT NULL DEFAULT 1 COMMENT '轮次序号（1 基）',
+  role        VARCHAR(16)  NOT NULL DEFAULT 'interviewer' COMMENT 'interviewer / candidate',
+  transcript  MEDIUMTEXT   NULL COMMENT '本轮文本（面试官追问 / 候选人回答转写）',
+  created_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_itv_turns_answer (answer_id, turn_no)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '语音模拟面试追问轮次（五期）';
 

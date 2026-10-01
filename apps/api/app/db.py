@@ -245,6 +245,54 @@ def _ensure_upgrade(conn: Any) -> None:
                 "  KEY idx_pipeline_user_trash (user_id, in_trash)"
                 ") ENGINE = InnoDB DEFAULT CHARSET = utf8mb4"
             )
+            # 五期（V2.11）语音模拟面试：会话 / 作答 / 追问轮次；
+            # 题目以 JSON 快照存于会话与作答行（动态出题，不入题库），录音仅存路径引用。
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS interview_sessions ("
+                "  id             VARCHAR(64)  NOT NULL COMMENT '面试会话 id（itv-xxxxxxxx）',"
+                "  user_id        VARCHAR(64)  NOT NULL COMMENT '所属用户（JWT sub）',"
+                "  mode           VARCHAR(32)  NOT NULL DEFAULT 'mixed' COMMENT '面试模式：tech / behavior / hr / mixed',"
+                "  target_job     VARCHAR(128) NOT NULL DEFAULT '' COMMENT '目标岗位',"
+                "  questions_json JSON         NOT NULL COMMENT '动态题目快照数组（不入题库）',"
+                "  status         VARCHAR(16)  NOT NULL DEFAULT 'running' COMMENT 'running / finished / abandoned',"
+                "  record_audio   TINYINT(1)   NOT NULL DEFAULT 0 COMMENT '本场是否开启录音留存（逐场显式开启）',"
+                "  report_json    JSON         NULL COMMENT '复盘报告（四维雷达 + 文字稿 + 建议），finish 后回写',"
+                "  started_at     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '开始时间',"
+                "  finished_at    DATETIME     NULL COMMENT '结束时间',"
+                "  PRIMARY KEY (id),"
+                "  KEY idx_itv_sessions_user (user_id, status)"
+                ") ENGINE = InnoDB DEFAULT CHARSET = utf8mb4"
+            )
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS interview_answers ("
+                "  id                   VARCHAR(64)  NOT NULL COMMENT '作答 id（itva-xxxxxxxx）',"
+                "  session_id           VARCHAR(64)  NOT NULL COMMENT '所属会话 id',"
+                "  seq                  INT          NOT NULL DEFAULT 0 COMMENT '题序（0 基）',"
+                "  question_json        JSON         NOT NULL COMMENT '本题快照（stem/dimension/keywords/followUp/suggestSec）',"
+                "  transcript           MEDIUMTEXT   NULL COMMENT 'ASR 转写文字稿',"
+                "  star_scores_json     JSON         NULL COMMENT 'STAR 四维评分 0~10',"
+                "  hit_keywords_json    JSON         NULL COMMENT '命中关键词数组',"
+                "  missed_keywords_json JSON         NULL COMMENT '未提及关键词数组',"
+                "  comment              TEXT         NULL COMMENT 'light 层即时点评',"
+                "  duration_sec         INT          NOT NULL DEFAULT 0 COMMENT '作答时长（秒）',"
+                "  recording_path       VARCHAR(500) NOT NULL DEFAULT '' COMMENT '录音文件相对路径（仅开启留存时非空）',"
+                "  created_at           DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '提交时间',"
+                "  PRIMARY KEY (id),"
+                "  KEY idx_itv_answers_session (session_id, seq)"
+                ") ENGINE = InnoDB DEFAULT CHARSET = utf8mb4"
+            )
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS interview_turns ("
+                "  id          VARCHAR(64)  NOT NULL COMMENT '追问轮次 id（itvt-xxxxxxxx）',"
+                "  answer_id   VARCHAR(64)  NOT NULL COMMENT '所属作答 id',"
+                "  turn_no     INT          NOT NULL DEFAULT 1 COMMENT '轮次序号（1 基）',"
+                "  role        VARCHAR(16)  NOT NULL DEFAULT 'interviewer' COMMENT 'interviewer / candidate',"
+                "  transcript  MEDIUMTEXT   NULL COMMENT '本轮文本（面试官追问 / 候选人回答转写）',"
+                "  created_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+                "  PRIMARY KEY (id),"
+                "  KEY idx_itv_turns_answer (answer_id, turn_no)"
+                ") ENGINE = InnoDB DEFAULT CHARSET = utf8mb4"
+            )
             # 题库归属隔离：旧库补 owner_id 列（空=公共题库/预置种子），幂等容忍已存在
             try:
                 cur.execute(
@@ -1152,7 +1200,11 @@ def mark_all_notifications_read(user_id: str) -> int:
 
 def clear_user_data(user_id: str) -> None:
     """注销清理：删除该用户全部数据行（进度 / 作答事件 / 错题 / 收藏 / 简历 / 计划 /
-    模考 / 站内信 / 每日一练 / 求职看板），users 行保留注销标记。"""
+    模考 / 站内信 / 每日一练 / 求职看板 / 面试会话），users 行保留注销标记。
+
+    面试三表无 user_id 列（作答/追问仅挂 session_id/answer_id），按会话归属级联清理；
+    录音文件由调用方（store.purge_user_data）一并删除。
+    """
     try:
         conn = connection()
         with conn.cursor() as cur:
@@ -1167,6 +1219,12 @@ def clear_user_data(user_id: str) -> None:
                 "DELETE FROM notifications WHERE user_id = %s",
                 "DELETE FROM daily_practices WHERE user_id = %s",
                 "DELETE FROM job_pipeline WHERE user_id = %s",
+                "DELETE t FROM interview_turns t "
+                "JOIN interview_answers a ON a.id = t.answer_id "
+                "JOIN interview_sessions s ON s.id = a.session_id WHERE s.user_id = %s",
+                "DELETE a FROM interview_answers a "
+                "JOIN interview_sessions s ON s.id = a.session_id WHERE s.user_id = %s",
+                "DELETE FROM interview_sessions WHERE user_id = %s",
             ):
                 cur.execute(sql, (user_id,))
     except Exception as exc:
@@ -1593,3 +1651,231 @@ def delete_pipeline_card(card_id: str) -> None:
             cur.execute("DELETE FROM job_pipeline WHERE id = %s", (card_id,))
     except Exception as exc:
         _warn(f"求职看板删库失败：{exc}")
+
+
+# ================= 语音模拟面试（五期，V2.11） =================
+# 会话 / 作答 / 追问轮次三表；题目以 JSON 快照存（动态出题不入题库）。
+# 内存态见 store.interview_sessions（活跃会话）；库不可用时降级纯内存（重启丢失，与既有范式一致）。
+
+
+_ITV_SESSION_COLS = (
+    "id, user_id, mode, target_job, questions_json, status, record_audio, "
+    "report_json, started_at, finished_at"
+)
+
+_ITV_ANSWER_COLS = (
+    "id, session_id, seq, question_json, transcript, star_scores_json, hit_keywords_json, "
+    "missed_keywords_json, comment, duration_sec, recording_path, created_at"
+)
+
+
+def _itv_session_row(row: tuple) -> dict[str, Any]:
+    """interview_sessions 行 -> 内存 session dict（JSON 列 PyMySQL 可能已反序列化）。"""
+    return {
+        "id": row[0],
+        "userId": row[1],
+        "mode": row[2] or "mixed",
+        "targetJob": row[3] or "",
+        "questions": row[4] if isinstance(row[4], list) else json.loads(row[4] or "[]"),
+        "status": row[5] or "running",
+        "recordAudio": bool(row[6]),
+        "report": (row[7] if isinstance(row[7], dict) else json.loads(row[7])) if row[7] else None,
+        "startedAt": row[8].strftime("%Y-%m-%d %H:%M:%S") if row[8] else "",
+        "finishedAt": row[9].strftime("%Y-%m-%d %H:%M:%S") if row[9] else None,
+    }
+
+
+def _itv_answer_row(row: tuple) -> dict[str, Any]:
+    """interview_answers 行 -> 内存 answer dict。"""
+    return {
+        "id": row[0],
+        "sessionId": row[1],
+        "seq": int(row[2]),
+        "question": row[3] if isinstance(row[3], dict) else json.loads(row[3] or "{}"),
+        "transcript": row[4] or "",
+        "starScores": (row[5] if isinstance(row[5], dict) else json.loads(row[5])) if row[5] else None,
+        "hitKeywords": row[6] if isinstance(row[6], list) else json.loads(row[6] or "[]"),
+        "missedKeywords": row[7] if isinstance(row[7], list) else json.loads(row[7] or "[]"),
+        "comment": row[8] or "",
+        "durationSec": int(row[9]),
+        "recordingPath": row[10] or "",
+        "createdAt": row[11].strftime("%Y-%m-%d %H:%M:%S") if row[11] else "",
+    }
+
+
+def save_interview_session(session: dict[str, Any]) -> None:
+    """面试会话写入/覆盖（一场一行，全量 upsert；status/report/finishedAt 变更也走此函数）。
+
+    started_at 只在首次插入时写入（ON DUPLICATE 不更新），避免续答覆盖原始开始时间。
+    """
+    report = session.get("report")
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO interview_sessions (id, user_id, mode, target_job, questions_json, "
+                "status, record_audio, report_json, started_at, finished_at) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                "ON DUPLICATE KEY UPDATE mode=VALUES(mode), target_job=VALUES(target_job), "
+                "questions_json=VALUES(questions_json), status=VALUES(status), "
+                "record_audio=VALUES(record_audio), report_json=VALUES(report_json), "
+                "finished_at=VALUES(finished_at)",
+                (
+                    session["id"], session["userId"], session.get("mode", "mixed"),
+                    session.get("targetJob", ""),
+                    json.dumps(session.get("questions", []), ensure_ascii=False),
+                    session.get("status", "running"),
+                    1 if session.get("recordAudio") else 0,
+                    json.dumps(report, ensure_ascii=False) if report is not None else None,
+                    session.get("startedAt") or datetime.now(),
+                    session.get("finishedAt"),
+                ),
+            )
+            conn.commit()
+    except Exception as exc:
+        _warn(f"面试会话写库失败：{exc}")
+
+
+def load_interview_session(user_id: str, session_id: str) -> dict[str, Any] | None:
+    """取一条面试会话（属主校验由调用方做；库不可用返回 None）。"""
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT {_ITV_SESSION_COLS} FROM interview_sessions "
+                "WHERE id = %s AND user_id = %s",
+                (session_id, user_id),
+            )
+            row = cur.fetchone()
+            return _itv_session_row(row) if row else None
+    except Exception as exc:
+        _warn(f"面试会话读取失败：{exc}")
+        return None
+
+
+def load_interview_sessions(user_id: str, limit: int = 50) -> list[dict[str, Any]]:
+    """该用户全部面试会话（倒序，历史列表源）。"""
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT {_ITV_SESSION_COLS} FROM interview_sessions "
+                "WHERE user_id = %s ORDER BY started_at DESC, id DESC LIMIT %s",
+                (user_id, int(limit)),
+            )
+            return [_itv_session_row(r) for r in cur.fetchall()]
+    except Exception as exc:
+        _warn(f"面试会话列表读取失败：{exc}")
+        return []
+
+
+def delete_interview_session(session_id: str) -> None:
+    """彻底删除面试会话（连带作答与追问轮次；注销/放弃清理用）。"""
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE t FROM interview_turns t "
+                "JOIN interview_answers a ON a.id = t.answer_id "
+                "WHERE a.session_id = %s",
+                (session_id,),
+            )
+            cur.execute("DELETE FROM interview_answers WHERE session_id = %s", (session_id,))
+            cur.execute("DELETE FROM interview_sessions WHERE id = %s", (session_id,))
+            conn.commit()
+    except Exception as exc:
+        _warn(f"面试会话删库失败：{exc}")
+
+
+def save_interview_answer(answer: dict[str, Any]) -> None:
+    """面试作答写入/覆盖（一题一行，全量 upsert；评分/转写补写也走此函数）。"""
+    scores = answer.get("starScores")
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO interview_answers (id, session_id, seq, question_json, transcript, "
+                "star_scores_json, hit_keywords_json, missed_keywords_json, comment, "
+                "duration_sec, recording_path) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                "ON DUPLICATE KEY UPDATE transcript=VALUES(transcript), "
+                "star_scores_json=VALUES(star_scores_json), hit_keywords_json=VALUES(hit_keywords_json), "
+                "missed_keywords_json=VALUES(missed_keywords_json), comment=VALUES(comment), "
+                "duration_sec=VALUES(duration_sec), recording_path=VALUES(recording_path)",
+                (
+                    answer["id"], answer["sessionId"], int(answer.get("seq", 0)),
+                    json.dumps(answer.get("question", {}), ensure_ascii=False),
+                    answer.get("transcript", ""),
+                    json.dumps(scores, ensure_ascii=False) if scores is not None else None,
+                    json.dumps(answer.get("hitKeywords", []), ensure_ascii=False),
+                    json.dumps(answer.get("missedKeywords", []), ensure_ascii=False),
+                    answer.get("comment", ""),
+                    int(answer.get("durationSec", 0)),
+                    answer.get("recordingPath", ""),
+                ),
+            )
+            conn.commit()
+    except Exception as exc:
+        _warn(f"面试作答写库失败：{exc}")
+
+
+def load_interview_answers(session_id: str) -> list[dict[str, Any]]:
+    """某会话全部作答（按题序升序）。"""
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT {_ITV_ANSWER_COLS} FROM interview_answers "
+                "WHERE session_id = %s ORDER BY seq ASC, id ASC",
+                (session_id,),
+            )
+            return [_itv_answer_row(r) for r in cur.fetchall()]
+    except Exception as exc:
+        _warn(f"面试作答读取失败：{exc}")
+        return []
+
+
+def save_interview_turn(turn: dict[str, Any]) -> None:
+    """追问轮次写入（append-only；一轮一行，同 id 重写容错）。"""
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO interview_turns (id, answer_id, turn_no, role, transcript) "
+                "VALUES (%s,%s,%s,%s,%s) "
+                "ON DUPLICATE KEY UPDATE role=VALUES(role), transcript=VALUES(transcript)",
+                (
+                    turn["id"], turn["answerId"], int(turn.get("turnNo", 1)),
+                    turn.get("role", "interviewer"), turn.get("transcript", ""),
+                ),
+            )
+            conn.commit()
+    except Exception as exc:
+        _warn(f"面试追问写库失败：{exc}")
+
+
+def load_interview_turns(answer_id: str) -> list[dict[str, Any]]:
+    """某作答的全部追问轮次（按轮次升序）。"""
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, answer_id, turn_no, role, transcript, created_at "
+                "FROM interview_turns WHERE answer_id = %s ORDER BY turn_no ASC, id ASC",
+                (answer_id,),
+            )
+            rows = cur.fetchall()
+    except Exception as exc:
+        _warn(f"面试追问读取失败：{exc}")
+        return []
+    return [
+        {
+            "id": r[0],
+            "answerId": r[1],
+            "turnNo": int(r[2]),
+            "role": r[3] or "interviewer",
+            "transcript": r[4] or "",
+            "createdAt": r[5].strftime("%Y-%m-%d %H:%M:%S") if r[5] else "",
+        }
+        for r in rows
+    ]

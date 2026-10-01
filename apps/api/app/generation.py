@@ -996,3 +996,105 @@ def start_job_detail(task: store.GenerateTask, set_id: str, ctx: dict[str, Any])
     """启动单岗位专属出题后台任务（句柄挂在任务对象上防止被 GC）。"""
     task.set_id = set_id
     task.asyncio_handle = asyncio.create_task(run_generation_job_detail(task, set_id, ctx))
+
+
+# ================= 引擎 D：语音模拟面试动态出题（五期，文档 3.9） =================
+# 与题库出题（引擎 A/B/C）不同：产出「开放式口述题」而非单选客观题，实时生成、不落题库，
+# 以 JSON 快照存于面试会话（见 db.interview_sessions.questions_json）。
+
+_INTERVIEW_DIMENSIONS = ("STAR", "技术", "HR")
+
+# 各模式的维度侧重（出题提示词口径，非硬性配额；模型按岗位灵活分布）
+_INTERVIEW_MODE_HINT = {
+    "tech": "以「技术」维度为主（约 70%），深挖专业原理、技术选型与工程实践；辅以少量 STAR 项目题。",
+    "behavior": "以「STAR」维度为主（约 70%），考察项目经历（背景-任务-行动-结果）与行为素质；辅以少量技术题。",
+    "hr": "以「HR」维度为主（约 70%），考察求职动机、职业规划、团队协作与综合素质；辅以少量项目题。",
+    "mixed": "三个维度均衡分布（技术 / STAR / HR 各约三分之一），模拟一场综合面试。",
+}
+
+_INTERVIEW_GEN_SYSTEM = """你是资深面试官，正在为一场「语音模拟面试」实时出题。
+只输出 JSON 数组，不要解释性文字、不要 Markdown 围栏。
+
+数组每个元素结构：
+{
+  "stem": "开放式题干，一到两句，引导候选人展开口述（严禁出选择题、严禁给选项）",
+  "dimension": "STAR / 技术 / HR 三者之一",
+  "keywords": ["理想回答中应命中的关键要点，3~6 个，每个 2~8 字，须是可在口述中出现的实质词"],
+  "followUp": "针对本题的一层追问，深挖细节或量化结果，一句话",
+  "suggestSec": 建议作答时长（秒），60~180 的整数
+}
+
+硬性要求：
+- 题干必须结合候选人简历与目标岗位的真实技术栈/项目/职责，开放式、无标准答案选项；
+- dimension 含义：技术=专业能力深挖；STAR=项目经历（背景 Situation-任务 Task-行动 Action-结果 Result）；HR=综合素质与动机；
+- keywords 用于自动命中检测与评分，避免「沟通良好」「能力强」这类空泛词，要具体（如「索引下推」「QPS 提升 40%」「跨团队协作」）；
+- 各题互不重复，由浅入深覆盖该岗位核心考点，题量严格等于要求数量；
+- 所有内容用中文（技术专有名词保留英文）。"""
+
+
+def _normalize_interview_question(raw: Any) -> dict[str, Any] | None:
+    """结构校验 + 归一化；不满足硬性要求的题目直接丢弃（返回 None）。"""
+    if not isinstance(raw, dict):
+        return None
+    stem = str(raw.get("stem") or "").strip()
+    if not stem:
+        return None
+    dimension = str(raw.get("dimension") or "").strip()
+    if dimension not in _INTERVIEW_DIMENSIONS:
+        dimension = "技术"
+    raw_keywords = raw.get("keywords")
+    keywords = (
+        [str(k).strip()[:20] for k in raw_keywords if str(k or "").strip()][:8]
+        if isinstance(raw_keywords, list)
+        else []
+    )
+    follow_up = str(raw.get("followUp") or "").strip()
+    try:
+        suggest_sec = max(30, min(300, int(raw.get("suggestSec"))))
+    except (TypeError, ValueError):
+        suggest_sec = 90
+    return {
+        "stem": stem,
+        "dimension": dimension,
+        "keywords": keywords,
+        "followUp": follow_up,
+        "suggestSec": suggest_sec,
+    }
+
+
+async def generate_interview_questions(
+    mode: str, count: int, target_job: str, user_id: str
+) -> list[dict[str, Any]]:
+    """按「目标岗位 + 简历」实时生成开放式面试题（不落题库）。
+
+    产出结构：[{stem, dimension(STAR|技术|HR), keywords[], followUp, suggestSec}]；
+    复用 _resume_context 读简历画像，主模型（primary 层）一次成型；
+    结构校验淘汰不合格题，超出要求量裁剪，不足量按原样返回（容错由调用方决定）。
+    """
+    count = max(1, min(int(count or 8), 15))
+    mode_hint = _INTERVIEW_MODE_HINT.get(mode, _INTERVIEW_MODE_HINT["mixed"])
+    job_hint = (target_job or "").strip() or "（未指定，按简历目标岗位）"
+    user_prompt = (
+        f"候选人画像：\n{_resume_context(user_id)}\n\n"
+        f"目标岗位：{job_hint}\n"
+        f"维度侧重：{mode_hint}\n\n"
+        f"请生成 {count} 道开放式面试题，dimension 按上述侧重合理分布，题量严格等于 {count}。"
+    )
+    items = await llm.chat_json(
+        "primary",
+        [
+            {"role": "system", "content": _INTERVIEW_GEN_SYSTEM},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.7,
+        # 8~15 道开放题（含关键词 + 追问）约 2~3k tokens，8192 留足余量
+        max_tokens=8192,
+        # 非思考模式：与题库出题一致，思维链 token 计入输出曾致截断，且拖慢延迟
+        thinking=False,
+    )
+    if not isinstance(items, list):
+        raise llm.LlmError("面试出题输出不是 JSON 数组")
+    normalized = [q for q in (_normalize_interview_question(item) for item in items) if q]
+    if not normalized:
+        raise llm.LlmError("面试题目未通过结构校验")
+    return normalized[:count]

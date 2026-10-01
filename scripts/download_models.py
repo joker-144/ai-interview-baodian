@@ -61,6 +61,26 @@ MODEL_REGISTRY: dict[str, dict] = {
         "default": False,
         "repos": {"modelscope": "AI-ModelScope/bge-large-zh-v1.5", "hf": "BAAI/bge-large-zh-v1.5"},
     },
+    "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17": {
+        "label": "SenseVoice 语音识别（中/英/日/韩/粤）",
+        "kind": "asr",
+        "dimensions": None,
+        "sizeMB": 228,
+        "desc": "本地 ASR：五期语音模拟面试离线转写，int8 权重，约 22 倍实时",
+        "default": False,
+        # 直连 GitHub release 的 tarball（含 fp32 894MB + int8 228MB），经 gh-proxy 加速；
+        # 解压后只保留 int8 权重 + tokens + 少量自测样本，跳过 fp32 大文件
+        "tarball": {
+            "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/"
+            "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2",
+            "strip_prefix": "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/",
+            "keep": [
+                "model.int8.onnx", "tokens.txt",
+                "test_wavs/zh.wav", "test_wavs/en.wav",
+                "LICENSE", "README.md",
+            ],
+        },
+    },
 }
 
 # sentence-transformers 加载所需文件。required=False 的缺失可忽略（不同仓库文件不齐）。
@@ -77,6 +97,12 @@ FILES: list[tuple[str, bool]] = [
     ("special_tokens_map.json", False),
 ]
 WEIGHT_CANDIDATES = ["model.safetensors", "pytorch_model.bin"]
+
+# 各 kind 的权重判定文件（manifest 与 --list 按此识别「已下载」）
+WEIGHT_BY_KIND = {"embedding": WEIGHT_CANDIDATES, "asr": ["model.int8.onnx"]}
+
+# GitHub release 大文件加速代理：直连仅 ~57kB/s，经代理实测 ~11MB/s
+GITHUB_PROXY = "https://gh-proxy.com/"
 
 
 def _fmt_mb(num_bytes: int) -> str:
@@ -157,18 +183,82 @@ def _download_model(model_id: str, meta: dict, order: list[str]) -> bool:
     return False
 
 
+def _weight_of(folder: Path, kind: str) -> Path | None:
+    """按 kind 返回目录下已存在的权重文件（判定「已下载」与写 manifest 用）。"""
+    for name in WEIGHT_BY_KIND.get(kind, WEIGHT_CANDIDATES):
+        candidate = folder / name
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _download_tarball_model(model_id: str, meta: dict) -> bool:
+    """下载 GitHub release 的 tarball（经 gh-proxy 加速），只解压所需文件后删包。
+
+    用于 sherpa-onnx 语音模型：单个 .tar.bz2 内含 fp32 + int8，体积大，
+    只保留 keep 列表内成员（跳过 fp32），断点续传下载、流式解压。
+    """
+    import tarfile
+
+    spec = meta["tarball"]
+    target = MODELS_DIR / model_id
+    prefix = spec.get("strip_prefix", "")
+    keep = set(spec["keep"])
+    tar_path = MODELS_DIR / f"{model_id}.tar.bz2"
+    print(f"[down] {model_id} -> {target.relative_to(ROOT)}（tarball 解压，仅留 int8）")
+    started = time.time()
+
+    for idx, url in enumerate([GITHUB_PROXY + spec["url"], spec["url"]]):
+        label = "gh-proxy" if idx == 0 else "github 直连"
+        print(f"       源：{label}")
+        try:
+            if not _download_file(url, tar_path):
+                continue
+            target.mkdir(parents=True, exist_ok=True)
+            got = 0
+            with tarfile.open(tar_path, "r:bz2") as tf:
+                for member in tf:  # 流式遍历，边解压边跳过不需要的成员
+                    if not member.isfile():
+                        continue
+                    rel = (
+                        member.name[len(prefix):]
+                        if prefix and member.name.startswith(prefix)
+                        else member.name
+                    )
+                    if rel not in keep:
+                        continue
+                    src = tf.extractfile(member)
+                    if src is None:
+                        continue
+                    dest = target / rel
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    with src, open(dest, "wb") as fh:
+                        fh.write(src.read())
+                    got += 1
+            if got and _weight_of(target, meta["kind"]):
+                tar_path.unlink(missing_ok=True)
+                print(f"[done] {model_id} 用时 {time.time() - started:.1f}s（解压 {got} 个文件，源：{label}）")
+                return True
+            print("       解压未得到权重，换下一个源")
+        except (requests.RequestException, OSError, tarfile.TarError) as exc:
+            print(f"       {type(exc).__name__}: {str(exc)[:100]}，换下一个源")
+    tar_path.unlink(missing_ok=True)
+    print(f"[fail] {model_id} 所有下载源均失败")
+    return False
+
+
 def _write_manifest() -> None:
     """扫描本地目录，写出 manifest.json（管理端「本地模型」数据源）。"""
     entries = []
     for model_id, meta in MODEL_REGISTRY.items():
         folder = MODELS_DIR / model_id
-        weight = next((folder / n for n in WEIGHT_CANDIDATES if (folder / n).exists()), None)
+        weight = _weight_of(folder, meta["kind"])
         if weight is None:
             continue
         entries.append(
             {
                 "modelId": model_id,
-                "repo": meta["repos"].get("hf", ""),
+                "repo": meta.get("repos", {}).get("hf", ""),
                 "kind": meta["kind"],
                 "label": meta["label"],
                 "dimensions": meta.get("dimensions"),
@@ -195,7 +285,7 @@ def _write_manifest() -> None:
 def _show_list() -> None:
     for model_id, meta in MODEL_REGISTRY.items():
         folder = MODELS_DIR / model_id
-        weight = next((folder / n for n in WEIGHT_CANDIDATES if (folder / n).exists()), None)
+        weight = _weight_of(folder, meta["kind"])
         flag = f"已下载 {_fmt_mb(weight.stat().st_size)}" if weight else "未下载"
         star = "（默认）" if meta.get("default") else ""
         print(
@@ -222,7 +312,15 @@ def main() -> int:
 
     order = [args.source] if args.source else DEFAULT_ORDER
     targets = args.model or [k for k, v in MODEL_REGISTRY.items() if v.get("default")]
-    results = [_download_model(t, MODEL_REGISTRY[t], order) for t in targets if t in MODEL_REGISTRY]
+    results = [
+        (
+            _download_tarball_model(t, MODEL_REGISTRY[t])
+            if "tarball" in MODEL_REGISTRY[t]
+            else _download_model(t, MODEL_REGISTRY[t], order)
+        )
+        for t in targets
+        if t in MODEL_REGISTRY
+    ]
     _write_manifest()
     if not results or not any(results):
         return 1

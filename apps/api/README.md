@@ -1,6 +1,6 @@
 # AI 面试宝典 · API（apps/api）
 
-FastAPI 后端，对齐产品文档 4.5 接口。C 端为**真实链路**：分层 LLM 真实调用（简历解析 / 出题 / 体检评分 / AI 优化 / 学习计划与周报，均带降级路径）；数据**内存优先 + MySQL 尽力持久化**（`config/db.json`，连接失败自动降级回内存）；**管理端模型配置落盘**（`config/llm.json`，含混淆 Key，重启不丢）。
+FastAPI 后端，对齐产品文档 4.5 接口。C 端为**真实链路**：分层 LLM 真实调用（简历解析 / 出题 / 体检评分 / AI 优化 / 学习计划与周报 / 五期语音面试 STAR 评分与复盘，均带降级路径）；**语音：本地 SenseVoice ASR 离线转写 + 云端 Qwen3-TTS-Flash 实时合成**（五期）；数据**内存优先 + MySQL 尽力持久化**（`config/db.json`，连接失败自动降级回内存）；**管理端模型配置落盘**（`config/llm.json`，含混淆 Key，重启不丢）。
 
 ## 启动
 
@@ -32,8 +32,10 @@ apps/api/
     ├── llm.py         # 分层 LLM 调用（主模型/轻量模型/多模态，JSON 结构化输出 + 失败抛 LlmError）
     ├── analyzer.py    # 简历解析 + 能力维度评估 + 体检 checkup + AI 一键优化（LLM 失败走规则兜底）
     ├── generation.py  # 出题任务生命周期（后台任务 + SSE 观察者 + 终态写站内信）；【四期】引擎 B 两阶段评分漏斗（词法预筛 → LLM 深度匹配分）
-    ├── providers.py   # LLM 供应商注册表 + 模型发现
+    ├── providers.py   # LLM 供应商注册表 + 模型发现（五期：qwen 增 `voice` 能力与 `keyUrl`）
     ├── local_models.py # 本地模型离线推理（懒加载单例 + 真实自测）
+    ├── asr.py         # 【五期】本地 ASR（SenseVoice-Small int8 / sherpa-onnx）离线整段转写，懒加载进程内单例
+    ├── tts.py         # 【五期】云端 TTS（Qwen3-TTS-Flash / DashScope 裸 HTTP）题目实时合成，512 Token 上限保护 + 降级错误
     ├── llm_config_file.py # 模型配置 / 历史快照 / 审计的落盘读写边界（原子写）
     └── routers/
         ├── auth.py         # 注册 / 登录（密码 + 手机验证码 + 微信，JWT）/ 我的信息
@@ -51,6 +53,7 @@ apps/api/
         ├── exams.py        # 模拟考试：组卷 / 答题增量落库 / 暂停恢复 / 交卷判分 / 模考报告 / 补强练习
         ├── notifications.py # 站内通知（出题完成 / 模考报告 / 复习到期 / 面试临近）
         ├── me.py           # 我的 / 设置（P14）：资料 + 统计 + 注销冷静期 + 数据导出
+        ├── interview.py    # 【五期】语音模拟面试：创建/进度/capabilities/tts/作答/追问/finish/report/audio/删除（按 user_id 隔离）
         └── admin.py        # 【管理端】分层模型配置 / 连通性自测 / 回滚 / 审计（文档 4.6.1）
 ```
 
@@ -64,21 +67,35 @@ apps/api/
 | `KEY_SECRET` | `aib-dev-key-secret-change-me` | API Key 存储密钥，不入仓；当前为 XOR+base64 **混淆**（非加密），生产需换 KMS / Fernet |
 | `LOCAL_MODELS_DIR` | `apps/api/models` | 本地模型权重存放目录 |
 | `LOCAL_MODEL_THREADS` | `2` | 本地推理线程数；受限环境（容器 / 低内存）调低可避免 OpenBLAS 分配失败 |
+| `ASR_THREADS` | `4` | 【五期】本地 ASR（SenseVoice）推理线程数；4 线程实测约 22 倍实时 |
+| `ASR_MODEL_ID` | `sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17` | 【五期】本地 ASR 模型 id（`apps/api/models/<id>/`） |
+| `RECORDINGS_DIR` | `apps/api/recordings` | 【五期】面试录音留存目录（仅逐场显式开启才落盘，已 gitignored；DB 只存相对路径） |
 
 > MySQL 连接不走环境变量，见 `config/db.json`（模板 `db.json.example`）：`enabled=false`、密码错误或库不存在时打印告警并**自动降级内存模式**，其余功能不受影响。
 
-## 本地模型（Embedding 默认离线推理）
+## 本地模型（Embedding 向量 + 五期语音 ASR，均离线推理）
 
 ```powershell
 python scripts/download_models.py            # 下载默认模型 bge-small-zh-v1.5（约 91 MB）
 python scripts/download_models.py --list     # 查看可下载模型
 python scripts/download_models.py --model bge-large-zh-v1.5 --source modelscope
+# 【五期】本地语音 ASR（SenseVoice-Small int8，约 228 MB，非默认清单，需显式指定）：
+python scripts/download_models.py --model sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17
 ```
 
 - 权重下载到 `apps/api/models/<model_id>/`，**入仓跟踪**（团队共享、克隆即用；单文件 91MB 低于 GitHub 100MB 上限）。
-- 下载按 `ModelScope → hf-mirror → HuggingFace` 多源重试（实测 hf-mirror 的 `.safetensors` 会 302 到 xethub CDN 而超时，故优先 ModelScope）；完成后写 `manifest.json`，是管理端 `/api/admin/local-models` 的唯一数据源。
-- 运行时 `sentence-transformers` 以 `local_files_only=True` 加载，懒加载 + 进程内单例，**不出网、不计费**。
+- 向量模型按 `ModelScope → hf-mirror → HuggingFace` 多源重试（实测 hf-mirror 的 `.safetensors` 会 302 到 xethub CDN 而超时，故优先 ModelScope）；完成后写 `manifest.json`，是管理端 `/api/admin/local-models` 的唯一数据源。
+- **SenseVoice ASR（`kind=asr`）走 GitHub release 的 `.tar.bz2`**（`SOURCES` 含 `gh-proxy` 加速），脚本解压后仅保留 `model.int8.onnx` / `tokens.txt`；`manifest.json` 同样收录 `kind=asr` 条目。未下载时语音面试自动降级文字输入。
+- 运行时向量模型以 `sentence-transformers`、ASR 以 `sherpa_onnx.OfflineRecognizer.from_sense_voice` 加载（`local_files_only`），懒加载 + 进程内单例，**不出网、不计费**；ASR 重采样交 sherpa 内部（`accept_waveform(sr, samples)`），严禁 Python 层逐点重采样。
 - Embedding 层默认即 `provider=local / bge-small-zh-v1.5 / dim=512`；该层「测试连接」是**真实推理**，会校验同义句与无关句的相似度区分度。
+
+> **`sherpa-onnx` 装包必须走官方 PyPI 源**：`python -m pip install sherpa-onnx --index-url https://pypi.org/simple`（清华等国内镜像无此包，`requirements.txt` 已注明）。
+
+## 云端语音 TTS（五期，Qwen3-TTS-Flash）
+
+- TTS **不本地部署**，走云端**阿里百炼 DashScope**：`tts.py` 以裸 HTTP（`requests`，无需 SDK）`POST .../services/aigc/multimodal-generation/generation`，body `{"model":"qwen3-tts-flash","input":{"text","voice","language_type":"Chinese"}}`，Bearer Key 取 voice 层配置（`deobfuscate(cfg.apiKey)`）；解析 `output.audio.url` → 后端下载音频字节同源回传前端播放（非流式）。
+- **配置（管理端 `/admin/models` 的 voice 层）**：供应商与模型名**锁定「阿里云百炼 / qwen3-tts-flash」**（只读），只需填入百炼 DashScope API Key（Key 框下方「获取 API Key →」链接，读 `provider.keyUrl` = `https://help.aliyun.com/zh/model-studio/get-api-key`，新用户送 11 万字符额度），音色下拉切换（默认 Andre）。
+- voice 层 `baseUrl` 为 `https://dashscope.aliyuncs.com/api/v1`（**与 qwen 文本层的 `compatible-mode/v1` 不同**）；未配 Key 时 `POST /api/interview-sessions/{id}/tts` 报可读 502，不崩、不影响文字作答。
 
 ## 接口清单（实际注册路径，与产品文档 4.5 对应）
 
@@ -95,7 +112,7 @@ python scripts/download_models.py --model bge-large-zh-v1.5 --source modelscope
 | GET / POST | /api/question-sets | 题集列表 / 新建题集 |
 | GET / DELETE | /api/question-sets/{set_id} | 题集详情 / 删除题集（级联清理进度与错题） |
 | GET | /api/question-sets/{set_id}/questions | 题集内题目 |
-| POST | /api/question-sets/generate | 触发出题（统一入口，body: `{source, resumeId?, settings:{count, difficulty, with_answer}}`；`source` 三通道 = `resume` 简历驱动 / `job_search` 岗位市场级 / `jd_target` 单岗位专属。注：此处「三通道」指**出题来源**，与引擎 C 的**输入**三通道（粘贴链接 / 上传截图 / 粘贴文本）不是同一概念，后者属五期未实现） |
+| POST | /api/question-sets/generate | 触发出题（统一入口，body: `{source, resumeId?, settings:{count, difficulty, with_answer}}`；`source` 三通道 = `resume` 简历驱动 / `job_search` 岗位市场级 / `jd_target` 单岗位专属。注：此处「三通道」指**出题来源**，与引擎 C 的**输入**三通道（粘贴链接 / 上传截图 / 粘贴文本）不是同一概念，后者属六期未实现） |
 | GET | /api/question-sets/{task_id}/stream | SSE 流式出题进度（观察者，断开不影响生成） |
 | GET | /api/question-sets/{task_id}/progress | 轮询兜底 |
 | GET | /api/questions | 题目列表（按 setId 过滤） |
@@ -152,6 +169,17 @@ python scripts/download_models.py --model bge-large-zh-v1.5 --source modelscope
 | GET | /api/pipeline/trash | 【四期】回收站列表 |
 | POST | /api/pipeline/{card_id}/restore | 【四期】从回收站还原 |
 | DELETE | /api/pipeline/{card_id}/permanent | 【四期】彻底删除（永久） |
+| POST | /api/interview-sessions | 【五期】创建面试会话（body `{mode, targetJob, count, recordAudio}`）：按简历+目标岗位实时动态出题（不落题库），返回首题 |
+| GET | /api/interview-sessions | 【五期】本人面试会话列表 |
+| GET | /api/interview-sessions/capabilities | 【五期】语音能力探测 `{asrAvailable, ttsAvailable}`（前端据此降级） |
+| GET | /api/interview-sessions/{id} | 【五期】会话进度与当前题 |
+| POST | /api/interview-sessions/{id}/tts | 【五期】题目文字→音频（云端 Qwen3-TTS-Flash），同源回传可播放音频；无 Key 报可读 502 |
+| POST | /api/interview-sessions/{id}/answers | 【五期】上传 wav + `retainAudio` → 本地 ASR 转写 → light 层 STAR 四维 + 命中关键词（3s 内）→ 判定是否触发追问；`retainAudio=true` 才落盘 |
+| POST | /api/interview-sessions/{id}/answers/{aid}/followup | 【五期】提交追问作答（同上转写/评分，轮次挂 `interview_turns`） |
+| POST | /api/interview-sessions/{id}/finish | 【五期】primary 层生成复盘报告（四维雷达 + 每题文字稿 + 改进建议），回写 `report_json` |
+| GET | /api/interview-sessions/{id}/report | 【五期】读复盘报告（仅本人） |
+| GET | /api/interview-sessions/{id}/answers/{aid}/audio | 【五期】录音回放（仅本人、仅开启留存时；FileResponse） |
+| DELETE | /api/interview-sessions/{id} | 【五期】删除会话（级联清理作答/追问与落盘录音） |
 | GET | /api/health | 健康检查 |
 
 ### 管理端（需请求头 `X-Admin-Token`）
@@ -181,7 +209,7 @@ python scripts/download_models.py --model bge-large-zh-v1.5 --source modelscope
 > 接口命名已与文档 4.5 对齐：出题统一走 `POST /api/question-sets/generate`（`source` 区分简历 / 岗位检索 / JD 定向三通道），
 > 题集 CRUD 在 `/api/question-sets`，题目与全站统计在 `/api/questions`。
 > 其中 `source=jd_target`（JD 定向）四期增补只落地「**已检索 JD**」这一条输入路径（看板 zhipin 卡一键生成）；
-> 引擎 C 的完整输入三通道与岗位匹配度报告顺延至五期，见下「分期落地状态」。
+> 引擎 C 的完整输入三通道与岗位匹配度报告拆至六期（五期仅交付语音面试），见下「分期落地状态」。
 >
 > **二期新增能力**：学习计划（`/api/plans`，惰性 AI 生成 + 打卡）、周报（`/api/reports/weekly`）、模拟考试（`/api/exams` 全套）、
 > 简历多版本 + 体检 + AI 优化 + DOCX 下载（`/api/resumes*`）、站内通知（`/api/notifications`）、数据导出（`/api/me/export`）。
@@ -204,11 +232,11 @@ python scripts/download_models.py --model bge-large-zh-v1.5 --source modelscope
 > 无新增表，出题骨架复用引擎 A/B（六维规划 + 复判 + 去重 + SSE 进度）；单岗位出题依赖同一 Boss 环境（专用 Chrome CDP + 登录态），
 > 未就绪时任务降级报错引导，看板手动流转与手动录入不受影响。
 >
-> **范围边界（对齐产品文档第六章 V2.10 排期口径）**：四期实际交付 = 引擎 B 两阶段匹配评分漏斗 + 求职看板四列状态机 + **引擎 C 子集**（仅「已检索 JD」一条输入路径）。
-> 原挂在四期的「引擎 C 完整三通道（粘贴 BOSS 链接 / 上传岗位截图 / 粘贴 JD 文本）+ 岗位匹配度报告（JD×简历 匹配分 + 强/弱匹配 + 缺口→补强突击题包）+ 『结合我的简历生成』开关 + 掌握度图谱」
-> **已整体顺延至五期，后端当前未实现**（无对应路由与表；前端 `apps/web/app/jd/page.tsx` 仅为 `ComingSoon` 占位页，已标注「Web 五期 W14~W15」）；拆段理由与处置建议见文档 6.2 / 6.5 第 7 条。
+> **范围边界（对齐产品文档第六章 V2.11 排期口径）**：四期实际交付 = 引擎 B 两阶段匹配评分漏斗 + 求职看板四列状态机 + **引擎 C 子集**（仅「已检索 JD」一条输入路径）。
+> 原挂在四期、V2.10 顺延至五期的「引擎 C 完整三通道（粘贴 BOSS 链接 / 上传岗位截图 / 粘贴 JD 文本）+ 岗位匹配度报告（JD×简历 匹配分 + 强/弱匹配 + 缺口→补强突击题包）+ 『结合我的简历生成』开关 + 掌握度图谱」，
+> **V2.11 再行拆期**：五期实际仅交付「语音模拟面试」（本地 ASR + 云端 TTS + 动态出题 + STAR 评分 + 复盘 + 合规录音），上述引擎 C 完整通道与匹配度报告**拆至六期、后端当前未实现**（无对应路由与表；前端 `apps/web/app/jd/page.tsx` 仅为 `ComingSoon` 占位页）；掌握度图谱入 6.6 远期；拆段理由与处置建议见文档 6.2 / 6.5 第 7 条。
 
-## 分期落地状态（对齐产品文档第六章 V2.10）
+## 分期落地状态（对齐产品文档第六章 V2.11）
 
 | 期次 | 后端交付内容 | 状态 |
 |---|---|---|
@@ -216,14 +244,15 @@ python scripts/download_models.py --model bge-large-zh-v1.5 --source modelscope
 | 二期 W5~W7 | 学习计划 + 打卡 streak（`/api/plans*`）、本周统计三卡 + 近 7 天柱状（`/api/stats/week`）、模拟考试全套（组卷 / 增量落库 / 暂停恢复 / 判分 / 报告 / 补强）、简历多版本 + 体检报告 + AI 一键优化 + DOCX 导出、学习周报（页面 `/me/report` + 接口 `/api/reports/weekly`）、站内通知中心（`/api/notifications`）、数据导出（`/api/me/export`） | ✅ 已交付 |
 | 三期 W8~W10 | 引擎 B 岗位市场（boss-agent-cli 只读检索 + 分层采样 + 异常矩阵映射）、考点地图 `/api/jobs/map`、每日一练、`generate source=job_search`、三层缓存（`jobs_cache` / `job_details` / `job_maps`） | ✅ 已交付 |
 | 四期 W11~W13 | 引擎 B **两阶段匹配评分漏斗**（Stage1 词法预筛 top-K 无 LLM → 仅对 K 抓 JD 详情 → Stage2 LLM 产出 0~100 匹配分 + 理由，失败降级词法分不阻断；匹配分并入考点地图 `jobScores` 并回填看板卡）、求职看板 `/api/pipeline*`（四列状态机 / 回收站 / 趋势统计 / 面试临近提醒）、**引擎 C 子集** `generate source=jd_target`（单岗位专属预测题，看板一键生成 + 发起即挂接卡 setId）、检索卡「岗位要求」可折叠区、检索缓存 TTL 收紧为 1 天 | ✅ 已交付（引擎 C 仅子集） |
-| 五期 W14~W15 | Web 语音模拟面试（WebSocket 流式 ASR/TTS + STAR 四维评估 + 复盘报告 + 文字降级）、**引擎 C 完整三通道**（粘贴链接解析 security_id / 上传截图多模态解析 / 粘贴文本 LLM 结构化，复用同一 `source=jd_target` 并在 settings 增 `inputChannel` 分派）、**岗位匹配度报告**、**「结合我的简历生成」开关**、**掌握度图谱** | ⬜ 未开始 |
+| 五期 W14~W15 | Web 语音模拟面试：**本地 ASR**（`asr.py` SenseVoice-Small int8 / sherpa-onnx 离线整段转写）、**云端 TTS**（`tts.py` Qwen3-TTS-Flash / DashScope 裸 HTTP）、**动态出题**（`generation.generate_interview_questions` 按简历+岗位实时生成、不落题库）、面试路由（`/api/interview-sessions*`：创建/进度/capabilities/tts/作答/追问/finish/report/audio/删除）、STAR 四维实时评估 + 命中关键词 + 一层追问 + 四维雷达复盘、录音逐场显式开启/回放/级联清理、无麦克风/弱网/ASR 未下载降级文字 | ✅ 已交付 |
+| 六期（待排期） | **引擎 C 完整三通道**（粘贴链接解析 security_id / 上传截图多模态解析 / 粘贴文本 LLM 结构化，复用同一 `source=jd_target` 并在 settings 增 `inputChannel` 分派）、**岗位匹配度报告**（JD×简历 匹配分 + 强/弱匹配 + 缺口→补强突击题包）、**「结合我的简历生成」开关**（自五期拆出，掌握度图谱入产品文档 6.6 远期） | ⬜ 未开始 |
 | App A1~A3 W16~W22 | 小程序 / 移动端（复用本 API，不新增后端能力） | ⬜ 未开始 |
 
 > **口径不得混用**：`/api/jobs/map` 返回的 `jobScores`（`{securityId: {score, reason}}`）是**引擎 B 的市场级**匹配分——按「关键词 + 城市」批量评分、用于岗位卡「匹配 N%」与看板回填；
-> 五期「岗位匹配度报告」是**单岗位 JD×简历**的逐条强匹配 / 弱匹配 / 缺口三分类 + 缺口题包，产物模型与展示页均需新建，二者不是同一东西，接口与文档表述都不得互相替代。
+> 六期「岗位匹配度报告」是**单岗位 JD×简历**的逐条强匹配 / 弱匹配 / 缺口三分类 + 缺口题包，产物模型与展示页均需新建，二者不是同一东西，接口与文档表述都不得互相替代。
 >
-> **五期可复用点（已就绪）**：`generate` 的 `source=jd_target` 出题骨架（六维规划 + 复判 + 去重 + 落库 + SSE 进度）、题集按岗位名归并、看板卡 setId 挂接口径、`job_details` 单卡惰性抓取与 7 天缓存、notifications 站内信机制。
-> **五期需新建（当前不存在）**：语音链路（ASR/TTS/评估）、图片上传与多模态解析、`inputChannel` 分派、匹配度报告产物模型与表、掌握度图谱聚合。
+> **六期可复用点（已就绪）**：`generate` 的 `source=jd_target` 出题骨架（六维规划 + 复判 + 去重 + 落库 + SSE 进度）、题集按岗位名归并、看板卡 setId 挂接口径、`job_details` 单卡惰性抓取与 7 天缓存、notifications 站内信机制。
+> **六期需新建（当前不存在）**：图片上传与多模态解析、`inputChannel` 分派、匹配度报告产物模型与表、掌握度图谱聚合（语音链路已于五期交付，不再列入）。
 > 注：`app/models.py` 里的 `follow_up_json` / `resume_anchor` / `jd_anchor` 等列属 SQLAlchemy **预留定义**（该文件未参与实际建表，真实 DDL 在 `sql/schema.sql`），不可当作已落地能力引用。
 
 ## 岗位检索环境准备（三期，引擎 B）

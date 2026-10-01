@@ -27,9 +27,14 @@
 - 错题本：错因三分法（概念不清/审题失误/知识盲区）+ 艾宾浩斯五档（1/2/4/7/15 天）+ 连对 3 次归档；
 - 今日学习计划（AI 生成 3~5 项）、模拟考试、掌握度图谱、学习周报。
 
-### 4. 语音模拟面试
+### 4. 语音模拟面试（五期已交付）
 
-WebSocket 流式 ASR + TTS、AI 追问（复用题目 follow_up 链）、STAR 四维实时评估、命中关键词检测、复盘报告。
+- **ASR = 本地 SenseVoice-Small int8（sherpa-onnx）离线整段转写**：权重下载到 `apps/api/models/`（`kind=asr`）、进程内懒加载单例、离线推理不出网；录完即传、秒级返回文字稿（实测约 22 倍实时、错字率 ≈0.3%），**非 WebSocket 边说边转**；重采样交 sherpa 内部（严禁 Python 层逐点重采样）。
+- **TTS = 云端 Qwen3-TTS-Flash（阿里百炼 DashScope）**：裸 HTTP（无 SDK）一次性合成音频、后端下载后同源回传前端 `<audio>` 播放（非流式）；中英混排·数字·% 朗读显著优于本地 Kokoro；题目按简历+岗位动态生成后实时合成，**不做预合成缓存**（命中率低）。
+- **出题**：按「目标岗位 + 简历」实时动态生成开放式题（不落题库），题目以 JSON 快照存会话/作答记录。
+- **评估**：每题提交后 light 层出 STAR 四维（0~10）+ 命中/未提及关键词（3s 内）；作答单薄时复用题目 `follow_up` 自动追问一层；整场结束 primary 层生成复盘报告（四维雷达 + 每题文字稿 + 改进建议）。
+- **录音合规**：麦克风始终采集用于 ASR，但默认不留存、转写后即弃；「录音回放」逐场显式开启，开启才落盘（gitignored 本地目录、DB 仅存路径）、可回放可删，回放仅本人，随会话/注销级联清除。
+- **降级**：无麦克风权限 / 弱网 / ASR 权重未下载 → 自动切文字输入模式。
 
 ### 5. 平台侧模型配置管理端（内部工具）
 
@@ -54,7 +59,7 @@ WebSocket 流式 ASR + TTS、AI 追问（复用题目 follow_up 链）、STAR �
 users / resumes(file_key→对象存储) / question_sets(resume_id, security_id)
 questions(embedding vector) / user_question_state / review_schedule
 answer_events(按月分区, 统计事实源) / exam_records / jobs_cache(TTL 7d)
-study_plans / resume_reports / interview_answers / interview_turns
+study_plans / resume_reports / interview_sessions(questions_json 动态题快照) / interview_answers / interview_turns
 job_pipeline(四列状态机) / agent_checkpoints / agent_artifacts
 llm_config(分层模型配置, api_key 密文) / llm_config_history(可回滚快照)
 ```
@@ -68,11 +73,11 @@ llm_config(分层模型配置, api_key 密文) / llm_config_history(可回滚快
 | 编排 | LangGraph | 状态机回炉循环 + Checkpoint 持久化 |
 | 检索 | boss-agent-cli（MIT） | 只读、节流、JSON 信封适合编排 |
 | 存储 | PostgreSQL + pgvector | 关系 + 向量一库；对象存储放文件 |
-| 语音 | 流式 ASR/TTS | 首字 < 800ms，TTS 按题预合成 |
+| 语音 | 本地 SenseVoice（ASR）+ 云端 Qwen3-TTS-Flash（TTS） | ASR 离线整段转写秒级返回、不出网不限流；TTS 云端实时合成、中英混排朗读优 |
 
 ## 质量与合规红线
 
 1. 客观题答案双模型交叉验证，不一致题降权/待审；
-2. 简历脱敏后送 LLM；语音不留录音只留转写稿；支持一键注销物理删除（Web 端入口为 P14 `/me`：二次确认并逐条明示删除范围 → 7 天冷静期可撤回 → 到期清理不可逆）；
+2. 简历脱敏后送 LLM；语音面试麦克风始终采集用于本地 ASR（音频不出网）但默认不留存、仅留转写稿，录音回放逐场显式开启（开启才落盘、可回放可删、仅本人、随注销清除）；支持一键注销物理删除（Web 端入口为 P14 `/me`：二次确认并逐条明示删除范围 → 7 天冷静期可撤回 → 到期清理不可逆）；
 3. Boss 数据仅受控只读检索，不做批量采集/自动投递，页面展示数据来源声明；
 4. 全站统计仅聚合数据，低样本（<100 次作答）不展示。

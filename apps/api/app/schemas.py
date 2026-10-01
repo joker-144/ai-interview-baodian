@@ -339,6 +339,7 @@ class ProviderOut(BaseModel):
     baseUrl: str
     requiresKey: bool
     keyPlaceholder: str = ""
+    keyUrl: str = ""  # 获取 API Key 的官方文档链接（空=不展示），voice 层锁定 qwen 时给出
     capabilities: list[str] = []  # 可承接的分层：primary/light/vision/embedding/voice
     hint: str = ""
 
@@ -394,3 +395,103 @@ class AuditEntry(BaseModel):
     action: str
     layer: str
     detail: str
+
+
+# ---------- 语音模拟面试（五期，文档 3.9） ----------
+
+InterviewMode = Literal["tech", "behavior", "hr", "mixed"]
+InterviewStatus = Literal["running", "finished", "abandoned"]
+InterviewDimension = Literal["STAR", "技术", "HR"]
+InterviewRole = Literal["interviewer", "candidate"]
+
+
+class InterviewQuestion(BaseModel):
+    """动态生成的开放式面试题（JSON 快照，不入题库）。"""
+
+    stem: str
+    dimension: InterviewDimension = "技术"
+    keywords: list[str] = []
+    followUp: str = ""
+    suggestSec: int = 90
+
+
+class StarScores(BaseModel):
+    """STAR 四维评分（0~10）：situation 背景 / task 任务 / action 行动 / result 结果。
+
+    非 STAR 维度题（技术/HR）由 light 层按同一四维口径映射打分
+    （如技术题：situation=问题理解、task=方案目标、action=技术细节、result=成效量化）。
+    """
+
+    situation: int = Field(default=0, ge=0, le=10)
+    task: int = Field(default=0, ge=0, le=10)
+    action: int = Field(default=0, ge=0, le=10)
+    result: int = Field(default=0, ge=0, le=10)
+
+
+class InterviewSessionCreate(BaseModel):
+    """创建面试会话：实时出题，返回首题。"""
+
+    mode: InterviewMode = "mixed"
+    targetJob: str = Field(default="", max_length=128)
+    count: int = Field(default=8, ge=3, le=15)
+    recordAudio: bool = False  # 逐场显式开启录音留存（默认不留存）
+
+
+class InterviewTtsRequest(BaseModel):
+    """题目/追问文字转语音：传 text 直接合成（追问/重读），否则按 seq 取题干。"""
+
+    seq: int = -1
+    text: str = Field(default="", max_length=2000)
+
+
+class InterviewTurn(BaseModel):
+    """一层追问轮次（面试官提问 / 候选人回答）。"""
+
+    id: str = ""
+    turnNo: int = 1
+    role: InterviewRole = "interviewer"
+    transcript: str = ""
+
+
+class InterviewAnswer(BaseModel):
+    """单题作答 + 即时评分（light 层 3s 内返回）。"""
+
+    id: str
+    sessionId: str
+    seq: int
+    question: InterviewQuestion
+    transcript: str = ""
+    starScores: Optional[StarScores] = None
+    hitKeywords: list[str] = []
+    missedKeywords: list[str] = []
+    comment: str = ""
+    durationSec: int = 0
+    hasRecording: bool = False  # 仅开启留存且落盘成功为 True
+    followUp: Optional[str] = None  # 触发追问时回传面试官追问文本
+    turns: list[InterviewTurn] = []
+
+
+class InterviewReport(BaseModel):
+    """整场复盘报告（primary 层生成）：四维雷达 + 总评 + 优势/改进建议。"""
+
+    overall: int = Field(default=0, ge=0, le=100)  # 综合得分（百分制）
+    radar: StarScores = Field(default_factory=StarScores)  # 四维雷达（整场平均）
+    summary: str = ""  # 一段话总评
+    strengths: list[str] = []  # 亮点
+    improvements: list[str] = []  # 改进建议清单
+
+
+class InterviewSession(BaseModel):
+    """面试会话（含题目快照、进度、复盘报告）。"""
+
+    id: str
+    userId: str = ""
+    mode: InterviewMode = "mixed"
+    targetJob: str = ""
+    questions: list[InterviewQuestion] = []
+    status: InterviewStatus = "running"
+    recordAudio: bool = False
+    report: Optional[InterviewReport] = None
+    startedAt: str = ""
+    finishedAt: Optional[str] = None
+    answers: list[InterviewAnswer] = []  # 复盘页回放用（进度查询时按需填充）

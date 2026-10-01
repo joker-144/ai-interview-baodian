@@ -70,12 +70,14 @@ PROVIDERS: list[dict] = [
         "authStyle": "bearer",
         "requiresKey": True,
         "keyPlaceholder": "sk-...",
-        "capabilities": ["primary", "light", "vision", "embedding"],
+        # 管理端「获取 API Key」跳转（voice 层锁定该供应商，Key 输入框下方给出链接）
+        "keyUrl": "https://help.aliyun.com/zh/model-studio/get-api-key",
+        "capabilities": ["primary", "light", "vision", "embedding", "voice"],
         "staticModels": [
             "qwen-max", "qwen-plus", "qwen-turbo", "qwen-vl-max",
             "text-embedding-v4", "text-embedding-v3",
         ],
-        "hint": "OpenAI 兼容模式；国内直连稳定，中文语料强",
+        "hint": "OpenAI 兼容模式；国内直连稳定，中文语料强；语音层用 qwen3-tts-flash（走 DashScope 原生 api/v1，非兼容模式）",
     },
     {
         "id": "zhipu",
@@ -226,6 +228,7 @@ def list_providers() -> list[dict]:
             "baseUrl": p["baseUrl"],
             "requiresKey": p["requiresKey"],
             "keyPlaceholder": p["keyPlaceholder"],
+            "keyUrl": p.get("keyUrl", ""),
             "capabilities": p["capabilities"],
             "hint": p["hint"],
         }
@@ -237,10 +240,13 @@ def _local_models() -> list[dict]:
     """读取本地模型清单（由 scripts/download_models.py 生成 manifest.json）。"""
     from app import local_models
 
-    return [
-        {"id": m["modelId"], "label": f'{m["label"]}（dim {m["dimensions"]}）', "kind": m["kind"]}
-        for m in local_models.list_local_models()
-    ]
+    models = []
+    for m in local_models.list_local_models():
+        dims = m.get("dimensions")
+        # 向量模型标注维度；ASR 等无维度概念的模型（dimensions=None）只显示名称，避免「dim None」
+        label = f'{m["label"]}（dim {dims}）' if isinstance(dims, int) and dims > 0 else m["label"]
+        models.append({"id": m["modelId"], "label": label, "kind": m["kind"]})
+    return models
 
 
 def _fetch_remote(provider: dict, base_url: str, api_key: str) -> list[dict]:

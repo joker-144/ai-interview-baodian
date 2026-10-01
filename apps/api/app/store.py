@@ -378,7 +378,7 @@ LLM_LAYERS: list[dict[str, str]] = [
     {"layer": "light", "label": "轻量模型", "usage": "答案二次校验 / 结构化解析 / 去重判定"},
     {"layer": "vision", "label": "多模态模型", "usage": "JD 截图解析 / 简历扫描件 OCR"},
     {"layer": "embedding", "label": "Embedding", "usage": "题目去重 / 知识点检索"},
-    {"layer": "voice", "label": "语音（ASR/TTS）", "usage": "模拟面试（五期）"},
+    {"layer": "voice", "label": "语音合成（TTS）", "usage": "模拟面试·面试官读题（五期）"},
 ]
 
 LLM_CONFIG_SEED: dict[str, dict[str, Any]] = {
@@ -423,13 +423,17 @@ LLM_CONFIG_SEED: dict[str, dict[str, Any]] = {
         "enabled": True,
     },
     "voice": {
-        "provider": "openai",
-        "modelName": "whisper-1",
+        # 五期语音面试：题目文字→面试官语音，锁定云端 Qwen3-TTS-Flash（DashScope 原生 api/v1，
+        # 注意与 qwen 文本层的 compatible-mode/v1 不同）；中英混排/数字/% 朗读远好于本地 Kokoro。
+        # ASR（回答→文字）走本地 SenseVoice，不经此分层（见 app/asr.py，无需 Key）。
+        "provider": "qwen",
+        "modelName": "qwen3-tts-flash",
         "apiKey": "",
-        "baseUrl": "https://api.openai.com/v1",
-        "params": {"sampleRate": 16000, "ttsVoice": "alloy", "ttsModel": "tts-1"},
+        "baseUrl": "https://dashscope.aliyuncs.com/api/v1",
+        # ttsVoice=Andre（安德雷·沉稳磁性男声，管理端可切）；languageType 与题目语种一致发音更准
+        "params": {"ttsVoice": "Andre", "languageType": "Chinese", "speed": 1.0, "sampleRate": 24000, "timeoutSec": 30},
         "fallbackModel": "",
-        "enabled": False,
+        "enabled": True,
     },
 }
 
@@ -512,6 +516,9 @@ class RuntimeState:
     daily_practices: dict[str, dict[str, Any]] = field(default_factory=dict)
     # 求职看板（四期）：user_id -> list[看板卡 dict]（与 db.job_pipeline 同构，内存镜像 + MySQL 双写）
     job_pipeline: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    # 语音模拟面试（五期）：session_id -> 会话 dict（活跃会话内存态，与 db.interview_sessions 同构；
+    # 会话内嵌 answers 列表供内存模式兜底，作答/追问逐行双写 db）
+    interview_sessions: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """模型配置 / 历史 / 审计从 config/llm.json 恢复（不存在时由模板复制或走种子）。
@@ -530,6 +537,17 @@ class RuntimeState:
                     **saved,
                     "params": {**seed["params"], **saved.get("params", {})},
                 }
+            # voice 层迁移：旧默认种子（openai/whisper-1 且未填 Key）从未被用户自定义，
+            # 自动升级到云端 Qwen3-TTS-Flash；已填 Key 或改过供应商/模型的配置保持不动。
+            voice = self.llm_config.get("voice")
+            if (
+                voice
+                and voice.get("provider") == "openai"
+                and voice.get("modelName") == "whisper-1"
+                and not voice.get("apiKey")
+            ):
+                seed_voice = LLM_CONFIG_SEED["voice"]
+                self.llm_config["voice"] = {**seed_voice, "params": dict(seed_voice["params"])}
             if isinstance(persisted.get("history"), dict):
                 self.llm_history = persisted["history"]
             if isinstance(persisted.get("audit"), list):
@@ -1258,3 +1276,74 @@ def set_practice_progress(user_id: str, set_id: str) -> dict[str, int]:
     total = sum(1 for q in state.questions if q["setId"] == set_id)
     done = len(state.progress.get(user_id, {}).get(set_id, {}))
     return {"done": min(done, total), "total": total}
+
+
+# ---------------- 语音模拟面试（五期，内存镜像 + MySQL 双写） ----------------
+
+
+def interview_session(user_id: str, session_id: str) -> dict[str, Any] | None:
+    """取本人的面试会话：内存优先，未命中从 MySQL 拉（跨重启恢复 running 场景）。"""
+    session = state.interview_sessions.get(session_id)
+    if session is None:
+        session = db.load_interview_session(user_id, session_id)
+        if session is not None:
+            state.interview_sessions[session_id] = session
+    if session is None or session.get("userId") != user_id:
+        return None
+    return session
+
+
+def persist_interview_session(session: dict[str, Any]) -> None:
+    """面试会话变更后落库（创建/答题/结束都调，覆盖写全行）+ 同步内存镜像。"""
+    state.interview_sessions[session["id"]] = session
+    db.save_interview_session(session)
+
+
+def user_interview_sessions(user_id: str) -> list[dict[str, Any]]:
+    """历史列表：MySQL 可用直查，内存模式从 state 过滤倒序。"""
+    records = db.load_interview_sessions(user_id)
+    if records:
+        return records
+    mine = [s for s in state.interview_sessions.values() if s.get("userId") == user_id]
+    mine.sort(key=lambda s: s.get("startedAt", ""), reverse=True)
+    return mine
+
+
+def interview_answers(session_id: str) -> list[dict[str, Any]]:
+    """某会话全部作答（按题序升序）：MySQL 直查优先，内存模式回退会话内嵌列表。"""
+    rows = db.load_interview_answers(session_id)
+    if rows:
+        return rows
+    session = state.interview_sessions.get(session_id)
+    return list((session or {}).get("answers", []))
+
+
+def persist_interview_answer(answer: dict[str, Any]) -> None:
+    """面试作答落库 + 同步内存会话内嵌列表（重新作答按 seq 覆盖）。"""
+    session = state.interview_sessions.get(answer.get("sessionId", ""))
+    if session is not None:
+        answers = session.setdefault("answers", [])
+        seq = answer.get("seq")
+        index = next((i for i, a in enumerate(answers) if a.get("seq") == seq), None)
+        if index is None:
+            answers.append(answer)
+        else:
+            answers[index] = answer
+        answers.sort(key=lambda a: a.get("seq", 0))
+    db.save_interview_answer(answer)
+
+
+def interview_turns(answer_id: str) -> list[dict[str, Any]]:
+    """某作答的全部追问轮次（按轮次升序）：MySQL 直查。"""
+    return db.load_interview_turns(answer_id)
+
+
+def persist_interview_turn(turn: dict[str, Any]) -> None:
+    """追问轮次落库（append-only）。"""
+    db.save_interview_turn(turn)
+
+
+def drop_interview_session(session_id: str) -> None:
+    """彻底删除面试会话（内存 + 库级联清作答/追问；放弃/注销清理用）。"""
+    state.interview_sessions.pop(session_id, None)
+    db.delete_interview_session(session_id)

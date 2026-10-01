@@ -1,6 +1,6 @@
 # AI 智慧面试宝典 —— 产品与技术设计文档
 
-> 版本：V2.10（V2.6 基础上，二/三/四期与四期增补已按实际实现回填接口与落地状态；V2.10 修订第六章排期口径——四期范围回填为实际交付内容，引擎 C 完整三通道 / 岗位匹配度报告 / 掌握度图谱明确顺延至五期）
+> 版本：V2.11（V2.10 基础上，五期语音模拟面试已按实际实现回填——ASR 改为本地 SenseVoice 离线整段转写、TTS 改为云端 Qwen3-TTS-Flash 动态实时合成、面试题按简历+岗位动态生成不落题库、录音逐场显式开启；数据模型与接口表对齐实际 MySQL 表结构与端点；第六章五期收敛为「语音模拟面试」并将引擎 C 完整三通道 + 匹配度报告拆至六期）
 > 原型依据：`AI智慧面试宝典-原型/AI智慧面试宝典-原型-Web版.pdf`（8 页）＋ `AI智慧面试宝典-原型-移动版-App小程序.pdf`（13 页）
 > 定位：面向求职者的 AI 面试训练应用（结构化题库 + 智能出题），双端（Web ＋ 移动 App/小程序）
 > 关键词：结构化训练、简历驱动出题、岗位驱动出题、JD 定向出题、错题本、语音模拟面试、求职看板
@@ -13,6 +13,7 @@
 > V2.6 变更：① **管理端配置统一落盘**（4.6.1 第 2 条）：模型配置 / 历史快照 / 审计日志从「内存 + localStorage」改为统一持久化到 `apps/api/config/llm.json`（真实配置含混淆 Key，.gitignore 忽略不入仓；仓内是同目录模板 `llm.json.example`，Key 全空，供团队对齐字段结构；启动时缺失则从模板复制生成），重启后配置与 Key 不再丢失；② **前端管理端直连后端**：`/admin/models` 页的模型配置 / 供应商 / 模型发现 / 审计全部改调 `/api/admin/*` 真实接口，前端 Mock 层与 localStorage 中的管理端实现整体移除（页面依赖 API 服务运行）；③ **向量模型权重入仓**：`apps/api/models/` 从 .gitignore 忽略改为入仓跟踪（团队共享、克隆即用，单文件 91MB 低于 GitHub 100MB 上限）；④ **审计口径调整**：除「模型发现」（每次输入停顿防抖都触发，低价值噪音）外全部打点并落盘，页面每页 10 条分页呈现；⑤ 系统内路径统一相对化（如管理端「本地模型」目录回显 `apps/api/models`，接口与代码均不硬编码绝对路径）
 > V2.7~V2.9 变更：二期（学习计划 / 模考 / 简历体检与 AI 一键优化 / 学习周报 / 通知中心 / 数据导出）、三期（引擎 B 岗位市场 + 考点地图 + 每日一练）、四期（求职看板 + 引擎 B 两阶段匹配评分漏斗）与四期增补（引擎 C 子集单岗位专属预测题 + 检索卡「岗位要求」+ 检索缓存 TTL 收紧为 1 天）按实际实现逐章修订，详见各章内「V2.7 / V2.8 / V2.9 补」标注（3.5 / 4.5 接口表 / 4.7 存储口径 / 8.3 页面与落地状态）
 > V2.10 变更：**排期口径回填**——第六章四期范围改为实际交付内容（引擎 B 两阶段漏斗 + 求职看板 + 引擎 C 子集），原挂在四期的「引擎 C 三通道 / 岗位匹配度报告 / 掌握度图谱」顺延至五期（五期范围、验收标准与测试重点同步扩充，并给出排期加重提示）；学习周报归属修正为二期已交付（页面 `/me/report`，接口 `GET /api/reports/weekly`）；6.4 里程碑表与 6.5 差异说明同步修订
+> V2.11 变更：**五期语音模拟面试按实际实现回填**——① 3.9 语音链路与 4.1/4.2 架构口径修正：**ASR = 本地 SenseVoice-Small int8（sherpa-onnx）离线整段转写**（录完即传、秒级返回，非 WebSocket 边说边转）、**TTS = 云端 Qwen3-TTS-Flash（阿里百炼 DashScope）动态实时合成**（题目按简历+目标岗位动态生成后即时合成，不做预合成缓存）；② 4.4 数据表 / 4.5 接口表对齐实际 MySQL 结构与端点（sessions/answers/turns 三表 + tts/followup/finish/report/audio/DELETE 等端点）；③ 4.6 缓存策略删去「TTS 预合成缓存」、4.6.1 语音层配置补「模型锁定 + Key 获取链接」、4.7 会话记忆与技术栈口径注明实际为 **MySQL + 内存态**（非文档早期设想的 PG/Redis/LangGraph）；④ 第五章合规第 6 条补录音细则（逐场显式开启、默认不留存、开启才落盘、可回放可删、随会话/账号注销清除、回放仅本人）；⑤ 第六章五期收敛为「语音模拟面试（已交付）」，引擎 C 完整三通道 + 匹配度报告 + 掌握度图谱拆至**六期**（6.4 里程碑加六期行、6.5 补拆期定调）
 
 ---
 
@@ -368,14 +369,15 @@ JD 结构化（职责/硬性要求/加分项/团队与业务线）
 原型已含完整语音交互，功能规格随之升级：
 
 - **会话**：默认 10 题/场（可配置：行为面 STAR 专场、技术专场、HR 专场），顶部显示「模拟面试 · 产品经理 ｜ 第 3/10 题 ｜ 已进行 08:32」+「结束面试」随时退出；
-- **语音链路**：AI 面试官 TTS 朗读题目 → 用户语音作答（ASR 流式转写，波形聆听态 + 计时「正在聆听你的回答… 00:42」）→ 文字稿实时显示；
+- **语音链路**（V2.11 按实际实现回填）：AI 面试官 TTS 朗读题目（**云端 Qwen3-TTS-Flash** 实时合成，非流式：题目文字→后端一次性合成音频→同源回传前端 `<audio>` 播放）→ 用户语音作答（**本地 SenseVoice-Small int8（sherpa-onnx）离线整段转写**：录完即传、秒级返回文字稿，**非 WebSocket 边说边转**；录音期前端照常显示波形聆听态 + 计时「正在聆听你的回答… 00:42」）→ 文字稿显示；
 - **操作**：跳过本题 / 重新作答 / 提交回答；
 - **提示**：题卡下方明示「建议用 STAR 法则作答 · 建议时长 2 分钟」；
 - **实时 STAR 评估**（每题答完即时出分，右侧栏同步）：情境 / 任务 / 行动 / 结果四维 0~10 分（原型示例：8.5 / 7.8 / 8.2 / 7.5）；
 - **命中关键词检测**：题目预设关键词集，命中显示绿色 chip（如「数据驱动」「用户调研」），未命中显示灰色「量化结果（未提及）」——引导用户补齐表达；
 - **追问能力**：复用题目 `follow_up` 字段，作答单薄时 AI 面试官自动追问一层；
-- **复盘报告**：整场四维雷达、每题文字稿回放、改进建议清单；
-- 移动端降级：无麦克风权限或弱网时自动切换文字输入模式。
+- **复盘报告**：整场四维雷达、每题文字稿回放（**逐场显式开启录音留存时可回放原音**）、改进建议清单；
+- **录音合规（V2.11 补）**：麦克风**始终**采集用于 ASR（语音面试前提），但**默认不留存**、转写后即弃；「录音回放」为**逐场显式开启**（开场合规开关），开启才落盘 + 可回放，回放接口仅本人可访问；
+- 移动端降级：无麦克风权限或弱网时自动切换文字输入模式（ASR 权重未下载时同样降级）。
 
 ### 3.10 求职看板（V2.0 细化为四列状态机，原型 P8）
 
@@ -411,6 +413,8 @@ JD 结构化（职责/硬性要求/加分项/团队与业务线）
 
 ## 四、技术架构设计
 
+> **实现口径总注（V2.11）**：本章 4.1/4.2 架构图与决策表中的 **PostgreSQL + pgvector / Celery + Redis / LangGraph 状态机**为目标态设计口径；**当前实际实现为 MySQL（InnoDB/utf8mb4，PyMySQL）+ 服务端内存态（`store.RuntimeState`）**，出题编排为应用内异步流程（非 LangGraph），缓存/热生效走内存态与本地落盘（非 Redis 发布订阅）。向量/ASR 等本地模型离线推理入 `apps/api/models/`。后续接入目标态组件时只需替换对应持久化/队列边界模块，业务口径不变。
+
 ### 4.1 总体架构
 
 ```
@@ -436,7 +440,7 @@ JD 结构化（职责/硬性要求/加分项/团队与业务线）
 ┌────────────────────────────────────────────────────┐
 │ LLM 层：主模型(出题/体检/优化) + 轻量模型(校验/解析)   │
 │ + 多模态模型(截图/OCR) + Embedding(去重/知识检索)     │
-│ 语音：流式 ASR + TTS（面试官语音，题目音频预合成缓存）  │
+│ 语音：ASR(本地 SenseVoice 离线整段转写) + TTS(云端 Qwen3-TTS 实时合成)│
 │ 推送：小程序订阅消息 / App Push / Web 站内信           │
 └────────────────────────────────────────────────────┘
 ```
@@ -451,7 +455,7 @@ JD 结构化（职责/硬性要求/加分项/团队与业务线）
 | boss-agent-cli MCP 接入 | 登录态/节流/风控恢复已成熟，JSON 信封天然适合 Agent 编排；仅用只读检索（search/detail），合规边界锁死 |
 | PostgreSQL + pgvector | 关系数据 + 向量去重一库搞定，MVP 少一个故障点 |
 | 分层 LLM + 缓存优先 | 解析/校验用轻量模型，出题/体检/一键优化用主模型；JD 缓存 7 天 + 热门岗位题库共享，摊薄约 90% 成本 |
-| 语音：流式 ASR + TTS | 原型将语音模拟面试提前到第一梯队；WebSocket 流式链路保证「边说边转写」；TTS 按题预合成缓存 |
+| 语音：本地 ASR + 云端 TTS | 原型将语音模拟面试提前到第一梯队；**ASR 用本地 SenseVoice-Small int8（sherpa-onnx）离线整段转写**（实测约 22 倍实时、错字率 ≈0.3%，录完即传秒级返回，无云端限流/出网/实名风险，非 WebSocket 边说边转）；**TTS 用云端 Qwen3-TTS-Flash**（中英混排·数字·% 朗读显著优于本地 Kokoro），题目按简历+岗位动态生成后**实时合成**、命中率低不做预合成缓存 |
 | 全站统计：Redis 计数 + 每日落库 | 支撑「全站答对率 / 超越 N% 考生」，低样本保护防误导 |
 
 ### 4.3 出题编排 Agent（LangGraph 状态机）
@@ -505,9 +509,11 @@ resume_reports(id, resume_id, total_score, highlights_json, issues_json, advice_
 resume_versions(id, user_id, base_resume_id, kind[original|optimized], file_url, created_at)
 site_question_stats(question_id, attempts, correct_rate, updated_at)  -- 全站答对率
 mock_exam_percentile(exam_id, bucket, percentile)                     -- 模考百分位
-interview_sessions(id, user_id, mode, question_ids_json, status, started_at)
-interview_answers(id, session_id, question_id, transcript, star_scores_json,
-                  hit_keywords_json, missed_keywords_json, duration_sec)  -- 语音面试
+interview_sessions(id, user_id, mode, target_job, questions_json, status,   -- V2.11 对齐实际 MySQL：题目按简历+岗位动态生成，questions_json 存动态题目快照（不引用题库）
+                   record_audio, report_json, started_at, finished_at)
+interview_answers(id, session_id, seq, question_json, transcript, star_scores_json,  -- V2.11：seq 为题目序号、question_json 存该题快照（非外键 question_id）
+                  hit_keywords_json, missed_keywords_json, comment, duration_sec,
+                  recording_path, created_at)                              -- 语音面试：comment=light 层点评，recording_path 仅开启留存时落盘
 job_pipeline(id, user_id, company, role, stage[applied|written|interview|offer],
              event_at, status_note, question_set_id)                  -- 求职看板四列
 review_schedule(user_id, question_id, stage[1|2|4|7|15], due_date, done)  -- 艾宾浩斯队列
@@ -519,7 +525,7 @@ answer_events(id BIGINT, user_id, question_id, set_id, result, mode,
 agent_checkpoints(task_id, node, state_json, updated_at)             -- LangGraph 任务级快照（崩溃续跑）
 agent_artifacts(id, cache_key UNIQUE, kind[resume_parsed|jd_report|company_brief|match_report],
                 content_json, ref_id, expires_at, created_at)        -- Agent 中间产物缓存（一次解析多路消费）
-interview_turns(id, answer_id, turn_no, role[ai_followup|user], transcript)  -- 追问轮次（interview_answers 为首答，追问挂其下）
+interview_turns(id, answer_id, turn_no, role[interviewer|candidate], transcript)  -- 追问轮次（interview_answers 为首答，追问挂其下；V2.11：role 对齐实际 interviewer/candidate）
 push_tokens(id, user_id, channel[miniprogram|app], token, updated_at) -- App A1 期接入 Push 时启用
 
 -- 职责边界说明（V2.2 澄清，消除双表歧义）
@@ -570,8 +576,17 @@ push_tokens(id, user_id, channel[miniprogram|app], token, updated_at) -- App A1 
 | `POST /api/question-sets/generate`（source=jd_target） | 【四期增补】引擎 C（子集）单岗位专属出题通道（求职看板 zhipin 卡一键生成）：settings.securityId 必填（缺失 422），岗位名优先本人看板卡、回退检索缓存回填；题集按岗位名归并「{jobName} · 岗位专属预测题」（默认 30 题，显式 count 优先）；发起即挂接本人看板卡 setId（看板卡即刻显示该题集与进度）；后台取单份 JD（job_details 缓存 7 天，未命中节流抓取）→ 六维覆盖规划分批出题（复用引擎 A/B 复判/去重/落库骨架与 stream/progress、generate_done 站内信）；JD 不可得时任务降级 error，不污染看板 |
 | `GET /api/daily-practice` | 【三期】当日每日一练：首访惰性生成 10 题（薄弱知识点 60%——错题本未掌握项优先 + 其知识点关联题补足，随机 40%，不调 LLM，快照当日不变） |
 | `POST /api/daily-practice/progress` | 【三期】标记一题完成（判分走 /api/practice/submit 原链路，进度/错题/统计自然打通）；全部完成且今日未打卡 → streak+1（lastCheckinDate 同日去重） |
-| `POST /api/interview-sessions` | 创建模拟面试会话（多轮） |
-| `POST /api/interview-sessions/{id}/answers` | 提交语音转写稿，返回 STAR 实时评估与命中关键词 |
+| `POST /api/interview-sessions` | 【五期】创建模拟面试会话（body: `{mode, targetJob, count, recordAudio}`）：按简历+目标岗位**实时动态出题**（不落题库），返回首题；`Depends(get_current_user)` 按 user_id 隔离 |
+| `GET /api/interview-sessions` | 【五期】本人面试会话列表（模式/岗位/题数/状态/是否已出复盘） |
+| `GET /api/interview-sessions/capabilities` | 【五期】语音能力探测：`{asrAvailable, ttsAvailable}`（ASR 本地权重是否就绪 / voice 层是否已配 Key），前端据此降级 |
+| `GET /api/interview-sessions/{id}` | 【五期】取会话进度与当前题 |
+| `POST /api/interview-sessions/{id}/tts` | 【五期】题目文字→音频（调云端 Qwen3-TTS-Flash），同源回传可播放音频；无 Key 时报可读 502 |
+| `POST /api/interview-sessions/{id}/answers` | 【五期】上传 wav + `retainAudio` 标志 → 本地 ASR 转写 → light 层 STAR 四维 + 命中关键词（3s 内）→ 判定是否触发 `follow_up` 追问；`retainAudio=true` 才落盘录音 |
+| `POST /api/interview-sessions/{id}/answers/{aid}/followup` | 【五期】提交追问作答（同上转写/评分链路，追问轮次挂 `interview_turns`） |
+| `POST /api/interview-sessions/{id}/finish` | 【五期】primary 层生成复盘报告（四维雷达 + 每题文字稿 + 改进建议），回写 `report_json` |
+| `GET /api/interview-sessions/{id}/report` | 【五期】读复盘报告（仅本人） |
+| `GET /api/interview-sessions/{id}/answers/{aid}/audio` | 【五期】录音回放（仅本人、仅开启留存时；FileResponse） |
+| `DELETE /api/interview-sessions/{id}` | 【五期】删除会话（级联清理作答/追问与落盘录音） |
 | `GET /api/pipeline` / `POST /api/pipeline` | 【四期】求职看板四列列表（已投递/笔试/面试/Offer，排除回收站）+ 趋势统计（各阶段计数/本周新增/待面试/平均匹配分），GET 顺带惰性触发面试临近提醒 / 加入看板：zhipin 卡（securityId+keyword 回填岗位+匹配分+挂关键词岗位市场题集）或手动卡（外部平台降级录入） |
 | `PATCH /api/pipeline/{id}` / `DELETE /api/pipeline/{id}` | 【四期】流转阶段·改备注·设面试日期·换挂题集（仅本人卡，否则 404）/ 移入回收站（软删 in_trash=1） |
 | `GET /api/pipeline/trash` / `POST /api/pipeline/{id}/restore` / `DELETE /api/pipeline/{id}/permanent` | 【四期】回收站列表 / 还原 / 彻底删除 |
@@ -597,7 +612,7 @@ push_tokens(id, user_id, channel[miniprogram|app], token, updated_at) -- App A1 
 ### 4.6 LLM 成本与质量控制
 
 - **分层用模**：解析/校验/去重用轻量模型；出题/体检/一键优化用主模型；截图解析用多模态模型。
-- **缓存优先**：相同 JD（security_id 命中缓存）+ 相同简历版本直接复用历史套题；同岗位关键词的市场题库按「周」粒度共享缓存（脱敏后），热门岗位可摊薄 90% 出题成本；TTS 题目音频预合成缓存。
+- **缓存优先**：相同 JD（security_id 命中缓存）+ 相同简历版本直接复用历史套题；同岗位关键词的市场题库按「周」粒度共享缓存（脱敏后），热门岗位可摊薄 90% 出题成本。**语音面试不适用预合成缓存（V2.11）**：题目按「简历 + 目标岗位」动态生成、命中率低，TTS 改为逐题**实时合成**（非流式，一次性回传音频）。
 - **质量闭环**：用户对题目可点「题目有误 / 答案有误」，反馈进入 Critic 再训练样本池；客观题答案双模型交叉验证，不一致题降权或人工审核；全站答对率异常监测（某题答对率 < 5% 自动标疑人工审）。
 
 #### 4.6.1 模型配置管理端（V2.3 新增）
@@ -614,7 +629,7 @@ push_tokens(id, user_id, channel[miniprogram|app], token, updated_at) -- App A1 
 | 轻量模型 | 答案二次校验 / 结构化解析 / 去重判定 | 同上 |
 | 多模态模型 | JD 截图解析 / 简历扫描件 OCR | 同上 |
 | Embedding | 题目去重 / 知识点检索 | 供应商（含**本地模型**）、模型名、API Key、**向量维度**（改动需提示重建 pgvector 索引） |
-| 语音（ASR/TTS） | 模拟面试（五期） | 供应商、模型名、Key、采样率、TTS 音色 |
+| 语音（ASR/TTS） | 模拟面试（五期） | **ASR = 本地 SenseVoice（kind=asr，离线、无需 Key，在「本地模型」区展示）**；**TTS = 云端 Qwen3-TTS-Flash（voice 层）**：配置页**锁定供应商「阿里云百炼」+ 锁定模型名只读 `qwen3-tts-flash`**（隐藏发现下拉），Key 输入框下方增一行「获取 API Key →」超链（读 `provider.keyUrl`），音色改为下拉（Andre/Neil/Ethan 等） |
 
 **关键设计**：
 
@@ -635,7 +650,7 @@ push_tokens(id, user_id, channel[miniprogram|app], token, updated_at) -- App A1 
 | 简历原文件 / 优化版 / 数据导出包 | 对象存储（OSS/MinIO）私有桶 + 服务端签名 URL | `resumes.file_key` 只存对象 key，禁止公网直链；注销时物理删除对象（满足 15 章数据主权承诺） |
 | LLM 结果缓存 | Redis（热，TTL 24h~7d）+ `agent_artifacts` 表（冷，长期复用） | **缓存键 = hash(模型标识 + Prompt 模板版本 + 输入内容摘要)**：简历产物挂 resume 版本号，JD 产物挂 security_id；改 Prompt 版本即整体失效，防止新旧口径混杂 |
 | JD / 岗位检索缓存 | `jobs_cache` 表（PG），定时任务按 TTL 刷新 | V2.2 修正：取代 boss-agent-cli 的本地文件缓存，服务端多 worker 共享、可水平扩展；V2.9 四期增补：检索列表 TTL 收紧为 1 天（新鲜度优先），JD 详情 / 考点地图仍 7 天 |
-| 会话记忆（语音面试） | 会话内：LangGraph 内存态（多轮追问上下文）；会话后：`interview_answers` + `interview_turns` 持久化 | 会话结束即固化，复盘报告只读历史转写稿，不再依赖 LLM 会话内存 |
+| 会话记忆（语音面试） | 会话内：**服务端内存态 `store.RuntimeState.interview_sessions`**（多轮追问上下文）；会话后：`interview_answers` + `interview_turns` 持久化 | 会话结束即固化（复盘回写 `interview_sessions.report_json`），复盘报告只读历史转写稿，不再依赖 LLM 会话内存。**实现口径（V2.11）**：实际为 **MySQL + 内存态**，非文档早期设想的 LangGraph/Redis 会话记忆 |
 | 用户长期画像（记忆） | **不单独建画像表，按需实时聚合** | 计划生成 / 每日一练出题时，聚合近 30 天的 `user_question_state`（薄弱点）+ `review_schedule`（到期）+ `daily_stats`（节奏）+ `job_pipeline`（面试日程），以聚合摘要作为 LLM 输入——避免维护一份易腐化的画像快照，也缩小个人数据暴露面 |
 | 答题事件明细 | `answer_events`（按月分区表） | 全站答对率、掌握度图谱、周报的唯一事实源；`site_question_stats` 是其聚合派生表，可随时全量重算 |
 | 会话/对话记录 | `agent_checkpoints` 保留 30 天后清理 | Checkpoint 是任务恢复用的临时记忆，任务终态（成功/失败）落库后即可清理 |
@@ -651,7 +666,7 @@ push_tokens(id, user_id, channel[miniprogram|app], token, updated_at) -- App A1 
 3. **生成内容准确性**：参考答案标注「AI 生成，仅供参考」；客观题双验证机制。
 4. **公司背景信息**：仅聚合公开信息，注明信息时效。
 5. **全站统计隐私**：仅聚合数据，低样本不展示，分桶百分位不暴露个体。
-6. **语音数据**：面试录音默认不留存，仅保留转写文字稿用于复盘，用户可删除。
+6. **语音数据（V2.11 细化）**：麦克风**始终**采集用于 ASR（语音面试前提，本地 SenseVoice 离线转写、音频不出网）；**默认不留存**音频，转写后即弃，仅保留文字稿用于复盘；「录音回放」为**逐场显式开启**（开场合规开关），**开启才落盘**（gitignored 本地目录，DB 仅存路径引用）、可回放可删；回放接口**仅本人可访问**；录音随会话删除 / 用户注销一并级联清除。
 7. **公司背景 RAG 数据源（V2.2 补充）**：引擎 C 的公司背景情报仅采信公开可检索来源（官网、公开财报/新闻、百科类），抓取频率受控；入库时记录来源 URL 与抓取时间并在前端标注时效；不存储、不展示任何个人隐私相关的第三方信息。
 8. **LLM 供应商数据处理（V2.2 补充）**：脱敏后的简历/转写稿送第三方 LLM 需在隐私协议中明示；优先选择承诺「不用客户数据训练」的供应商；`agent_artifacts` 中的用户产物随注销一并删除。
 
@@ -708,17 +723,25 @@ push_tokens(id, user_id, channel[miniprogram|app], token, updated_at) -- App A1 
 
 > **V2.10 范围顺延说明**：本期原范围中的「引擎 C 三通道（粘贴链接/上传截图/粘贴文本）+ 岗位匹配度报告 + 『结合我的简历生成』开关 + 掌握度图谱」已明确顺延至五期（见下）；四期仅以 `source=jd_target` 落地引擎 C 的「已检索 JD」子集，未来三通道在同一 source 上扩展（settings 增 `inputChannel` 分派），题集归并与看板挂接口径可直接复用，不冲突。
 
-#### 五期（W14~W15）：语音模拟面试 + 引擎 C 完整通道（Web 版）
+#### 五期（W14~W15）：语音模拟面试（Web 版，已交付）
 
 | 项 | 内容 |
 |---|---|
-| 范围 | Web 语音会话（WebSocket 流式 ASR + TTS）；STAR 四维实时评估；命中关键词检测；复盘报告；文字模式降级。**（V2.10 自四期顺延）引擎 C 三通道**：粘贴链接（解析 BOSS URL 取 security_id → detail）/ 上传截图（多模态视觉解析出 JD 文本）/ 粘贴文本（LLM 结构化，不触达平台，作为终极兜底并覆盖非 BOSS 渠道岗位与看板手动卡），三通道复用已落地的 `source=jd_target`；**岗位匹配度报告**（JD×简历 → 匹配分 + 强匹配/弱匹配/缺口三分类 + 缺口→补强突击题包，即 3.6 「岗位冲刺包」）；**「结合我的简历生成」开关**（开=交叉题+报告，关=仅 JD 通用定向题）；**掌握度图谱**（知识点热力图，点击知识点直刷对应题） |
-| 验收标准 | ASR 首字延迟 < 800ms；提交后评估返回 < 3s；无麦克风权限/弱网自动降级文字模式；三通道各 10 例端到端出题通过；「手动粘贴 JD」兜底通道可用（看板手动卡/外部平台卡也能出专属题）；匹配度报告与缺口题包联动可用；截图识别失败可降级到粘贴文本通道 |
-| 测试重点 | 语音链路并发压测（50 路会话）；转写准确率抽检；TTS 预合成缓存命中率；截图识别样本测试（多机型/清晰度/深色模式）与识别失败降级路径；匹配度报告与引擎 B `jobScores`（市场级词法+LLM 评分）口径不得混用；公司背景 RAG 若同期纳入，需校验合规第 7 条（仅公开来源 + 记录来源 URL 与抓取时间 + 前端标注时效） |
+| 范围 | **本地 ASR 基座**（SenseVoice-Small int8 / sherpa-onnx，下载脚本扩展 tarball 分派 + `apps/api/models/` 离线推理）；**云端 TTS**（Qwen3-TTS-Flash / DashScope 裸 HTTP，默认音色 Andre，配置页锁定模型 + Key 获取链接）；**动态出题**（按目标岗位 + 简历实时生成开放式题，不落题库）；**面试路由**（创建/进度/tts/作答/追问/finish/report/audio/删除）；**前端面试页 + 复盘页**（录音/波形/TTS 播放/STAR 四维/命中关键词/一层追问/四维雷达复盘）；**合规录音**（逐场显式开启、默认不留存）；**降级**（无麦克风/弱网/ASR 未下载→文字输入） |
+| 验收标准 | 本地 ASR 离线转写秒级返回（实测约 22 倍实时、错字率 ≈0.3%）；提交后 STAR 评估返回 < 3s；TTS 无 Key 时报可读 502 不崩；无麦克风权限/弱网/ASR 未就绪自动降级文字模式；录音仅开启留存时落盘、回放/删除仅本人、随会话/注销级联清理；全链路（创建→答题→录音→提交→追问→结束→复盘）浏览器走查 console 0 error |
+| 测试重点 | 后端 `py_compile` + 接口自测（文字/音频两条作答路径）；前端 `tsc --noEmit` + 浏览器走查全流程；SenseVoice 真实转写样例 wav（中/英/日/韩/粤）；录音上传→回放→删除→404 级联清理；合规边界（越权访问、目录穿越） |
 
-> **排期加重提示（V2.10）**：五期自原「仅语音面试（2 周）」扩充为「语音面试 + 引擎 C 完整通道 + 匹配度报告 + 掌握度图谱」，范围显著加重。建议三选一：① 五期扩为 4 周（W14~W17，Web 合计 17 周，App 各期相应顺延）；② 拆为五期（语音）+ 六期（引擎 C 完整通道 + 匹配度报告），掌握度图谱入 6.6 远期；③ 按 6.1 第 6 条人力假设裁剪当期 P2 项（掌握度图谱优先后置）。未定调前，6.4 里程碑表仍按 W14~W15 列出。
+#### 六期（待排期）：引擎 C 完整三通道 + 岗位匹配度报告（Web 版）
 
-> Web 端合计 **15 周**（W1~W15），每期之间含回归测试窗口；若按上述提示① 将五期扩为 4 周，则合计 17 周（W1~W17）。
+| 项 | 内容 |
+|---|---|
+| 范围 | **（V2.10 自四期顺延、V2.11 自五期拆出）引擎 C 三通道**：粘贴链接（解析 BOSS URL 取 security_id → detail）/ 上传截图（多模态视觉解析出 JD 文本）/ 粘贴文本（LLM 结构化，不触达平台，作为终极兜底并覆盖非 BOSS 渠道岗位与看板手动卡），三通道复用已落地的 `source=jd_target`；**岗位匹配度报告**（JD×简历 → 匹配分 + 强匹配/弱匹配/缺口三分类 + 缺口→补强突击题包，即 3.6 「岗位冲刺包」）；**「结合我的简历生成」开关**（开=交叉题+报告，关=仅 JD 通用定向题） |
+| 验收标准 | 三通道各 10 例端到端出题通过；「手动粘贴 JD」兜底通道可用（看板手动卡/外部平台卡也能出专属题）；匹配度报告与缺口题包联动可用；截图识别失败可降级到粘贴文本通道 |
+| 测试重点 | 截图识别样本测试（多机型/清晰度/深色模式）与识别失败降级路径；匹配度报告与引擎 B `jobScores`（市场级词法+LLM 评分）口径不得混用；公司背景 RAG 若同期纳入，需校验合规第 7 条（仅公开来源 + 记录来源 URL 与抓取时间 + 前端标注时效） |
+
+> **拆期定调（V2.11）**：五期已按「仅语音面试」实际交付（本地 ASR + 云端 TTS + 动态出题 + STAR 评分 + 复盘 + 合规录音 + 降级）；原 V2.10 挂在五期的「引擎 C 完整三通道 + 岗位匹配度报告 + 『结合我的简历生成』开关」拆至**六期**（采纳 6.2 原排期加重提示的建议②）；**掌握度图谱**（知识点热力图）入 6.6 远期。
+
+> Web 端合计 **15 周**（W1~W15）为五期语音交付口径；六期（引擎 C 完整通道 + 匹配度报告）待单独排期（预估 2~3 周，插于五期与 App A1 期之间或并入 App 期前的机动窗口）。
 
 ### 6.3 App/小程序端分期计划（Web 全部验收后启动，总 7 周）
 
@@ -735,7 +758,7 @@ push_tokens(id, user_id, channel[miniprogram|app], token, updated_at) -- App A1 
 | 项 | 内容 |
 |---|---|
 | 范围 | 语音模拟面试移动版（移动端录音 + 波形聆听态，复用五期后端）；求职看板移动版（纵向分组 + 明天面试高亮）；模考报告移动版；套题分享卡片（裂变入口） |
-| 验收标准 | 移动语音指标与 Web 一致（首字 < 800ms）；分享卡片打开 → 注册转化埋点完整 |
+| 验收标准 | 移动语音指标与 Web 一致（本地 ASR 离线整段转写秒级返回、非首字延迟口径）；分享卡片打开 → 注册转化埋点完整 |
 | 测试重点 | 真机音频采集测试（主流机型麦克风/权限弹窗）；分享链路全平台兼容（微信/浏览器打开） |
 
 #### A3 期（W22）：收尾发版
@@ -754,7 +777,8 @@ push_tokens(id, user_id, channel[miniprogram|app], token, updated_at) -- App A1 
 | Web 二期 | W5~W7 | 学习计划 + 模考 + 简历体检/一键优化 | 一期回归通过 + 模考恢复用例通过 |
 | Web 三期 | W8~W10 | 引擎 B + 考点地图 + 每日一练 | 异常矩阵专项通过 + 检索成功率 ≥ 95% |
 | Web 四期 | W11~W13 | 求职看板 + 引擎 B 两阶段匹配漏斗 + 引擎 C 子集（单岗位专属预测题） | 看板 E2E + 单岗位出题 E2E + 隔离/并发回归通过（V2.10 回填） |
-| Web 五期 | W14~W15 | Web 语音模拟面试 + 引擎 C 三通道 + 匹配度报告 + 掌握度图谱 | 语音性能指标达标 + 三通道 E2E 通过 + 报告与缺口题包联动（范围加重，见 6.2 排期提示） |
+| Web 五期 | W14~W15 | Web 语音模拟面试（本地 ASR + 云端 TTS + 动态出题 + STAR 评分 + 复盘 + 合规录音 + 降级）（已交付） | 语音全链路 E2E + 降级与录音合规验收 + 走查 console 0 error（V2.11 回填） |
+| Web 六期 | 待排期 | 引擎 C 完整三通道 + 岗位匹配度报告（自五期拆出） | 三通道各 10 例 E2E + 报告与缺口题包联动（V2.11 拆期） |
 | App A1 | W16~W18 | 小程序核心功能 + Push | 双端一致性 + 提审通过 |
 | App A2 | W19~W21 | 移动语音面试 + 看板 + 分享 | 真机音频测试通过 |
 | App A3 | W22 | 收尾发版 | 全量回归 + 灰度无 P0/P1 |
@@ -764,14 +788,15 @@ push_tokens(id, user_id, channel[miniprogram|app], token, updated_at) -- App A1 
 1. **双端并行 → Web 先行**：原 V1.0「双端（Web + 小程序）」改为 Web 五期全部验收后再启动 App，端侧适配风险后移，后端在 Web 期充分验证。
 2. **全站统计前移**：轻量答对率统计从 V1.5 前移至 Web 一期（修正「题目详情一期上线但统计服务二期才有的依赖倒挂」）。
 3. **复习提醒渠道分段**：Web 期为站内信 + 浏览器通知；小程序订阅消息 / App Push 于 App A1 期接入（修正「推送依赖移动载体但 Web 先行」的断层）。
-4. **语音面试拆两段**：后端能力（ASR/TTS/评估）在 Web 五期建成，移动端体验在 App A2 期复用，避免重复开发。
+4. **语音面试拆两段**：后端能力（本地 ASR / 云端 TTS / 评估）在 Web 五期建成，移动端体验在 App A2 期复用，避免重复开发。（V2.11 回填）五期实际交付为本地 SenseVoice 离线整段转写（非 WebSocket 流式）+ 云端 Qwen3-TTS-Flash 实时合成（非预合成缓存），首字延迟指标不再适用，改为「录完即传、秒级返回文字稿」。
 5. **口径统一**：引擎 A 题量统一为「精简 40 / 标准 80 / 深度 120」三档、默认 80（消除 60~100 与 120 的不一致）；模拟考试统一为 20~30 题 / 45 分钟。
 6. **门禁制正式化**：每期增加准出硬指标与三方验收评审，测试不通过不顺延压缩，宁可顺延排期。
-7. **四期范围回填与引擎 C 拆段（V2.10 修订）**：四期实际交付为「引擎 B 两阶段匹配评分漏斗 + 求职看板四列状态机 + 引擎 C 子集（`source=jd_target` 单岗位专属预测题，看板一键生成）+ 检索卡岗位要求 + 检索缓存 TTL 1 天」，6.2/6.4 已按此回填；原四期范围中的「引擎 C 三通道（链接/截图/粘贴文本）+ 岗位匹配度报告 + 『结合我的简历生成』开关 + 掌握度图谱」整体顺延至五期，与语音面试同期（排期加重，处置建议见 6.2 五期提示）。拆段理由：三通道中的截图依赖多模态模型与图片存储、链接与反查会新增平台触达面（风控敏感），匹配度报告需新产物模型与展示页，均不具备随看板同批交付的条件；而「已检索 JD」子集可完全复用预留 source 与出题骨架，零契约变更即可满足「单岗位专属预测题」的核心诉求。另修正：学习周报属二期交付（页面 `/me/report` + 接口 `GET /api/reports/weekly`），不再计入四期范围。
+7. **四期范围回填与引擎 C 拆段（V2.10 修订、V2.11 再拆期）**：四期实际交付为「引擎 B 两阶段匹配评分漏斗 + 求职看板四列状态机 + 引擎 C 子集（`source=jd_target` 单岗位专属预测题，看板一键生成）+ 检索卡岗位要求 + 检索缓存 TTL 1 天」，6.2/6.4 已按此回填；原四期范围中的「引擎 C 三通道（链接/截图/粘贴文本）+ 岗位匹配度报告 + 『结合我的简历生成』开关 + 掌握度图谱」在 V2.10 顺延至五期后，**V2.11 再行拆期**：五期实际仅交付「语音模拟面试」（本地 ASR + 云端 TTS + 动态出题 + STAR 评分 + 复盘 + 合规录音），「引擎 C 三通道 + 匹配度报告 + 结合简历开关」拆至**六期**（采纳原排期加重提示的建议②），**掌握度图谱**入 6.6 远期。拆段理由：三通道中的截图依赖多模态模型与图片存储、链接与反查会新增平台触达面（风控敏感），匹配度报告需新产物模型与展示页，与语音面试（本地 ASR + 云端 TTS）属不同技术栈，不宜同批交付；而「已检索 JD」子集可完全复用预留 source 与出题骨架，零契约变更即可满足「单岗位专属预测题」的核心诉求。另修正：学习周报属二期交付（页面 `/me/report` + 接口 `GET /api/reports/weekly`），不再计入四期范围。
 
 ### 6.6 远期方向（V2.5+，不计入本 22 周排期）
 
 - App 原生壳（iOS/Android，视小程序 A3 期数据决策）
+- **掌握度图谱**（知识点热力图，点击知识点直刷对应题；V2.11 自五期后置至远期，依赖 `answer_events` 聚合与知识点标签体系）
 - 社区面经 UGC + AI 结构化沉淀回题库
 - 企业版（校招题库定制）
 

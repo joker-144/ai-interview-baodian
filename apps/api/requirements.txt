@@ -10,6 +10,11 @@ sentence-transformers>=3.0
 # scripts/download_models.py 下载权重时使用（多源直连 + 断点续传）
 requests>=2.31
 
+# 本地语音识别（ASR）：SenseVoice-Small，五期语音模拟面试离线转写。
+# sherpa-onnx 自带 onnxruntime、零第三方依赖；但镜像站无此包，必须用官方 PyPI 源安装：
+#   pip install sherpa-onnx --index-url https://pypi.org/simple
+sherpa-onnx>=1.13
+
 # 引擎 A 真实链路：简历文件上传与解析（PDF / DOCX / TXT）
 python-multipart>=0.0.9
 pypdf>=4.2

@@ -17,7 +17,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 
-from app import llm_config_file, local_models, providers, store
+from app import llm_config_file, local_models, providers, store, tts
 from app.config import settings
 from app.keys import deobfuscate, mask_key, obfuscate
 from app.schemas import (
@@ -241,6 +241,26 @@ def test_llm_config(layer: LlmLayer, actor: str = Depends(verify_admin)) -> LlmT
     if not cfg["baseUrl"].startswith(("http://", "https://")):
         _audit("test_conn", layer, f"失败：base_url 非法（{cfg['baseUrl']}）")
         return LlmTestResult(ok=False, error="base_url 需以 http:// 或 https:// 开头")
+
+    if layer == "voice":
+        # 语音层（云端 TTS）：真实合成一小段文字，回传真延迟与音频大小（配好 Key 即验证音质/中英混排）
+        try:
+            result = tts.selftest()
+        except Exception as exc:  # 兜底：网络/解析等异常不让自测接口 500
+            _audit("test_conn", layer, f"失败：{exc}")
+            return LlmTestResult(ok=False, error=str(exc))
+        _audit(
+            "test_conn",
+            layer,
+            ("成功：" if result["ok"] else "异常：")
+            + (result.get("detail") or result.get("error") or ""),
+        )
+        return LlmTestResult(
+            ok=result["ok"],
+            latencyMs=result.get("latencyMs"),
+            detail=result.get("detail"),
+            error=result.get("error"),
+        )
 
     latency = random.randint(180, 900)
     tokens = random.randint(12, 48)

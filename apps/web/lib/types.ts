@@ -377,6 +377,8 @@ export interface LlmProvider {
   baseUrl: string;
   requiresKey: boolean;
   keyPlaceholder: string;
+  /** 获取 API Key 的官方文档链接（缺省=不展示）；voice 层锁定 qwen 时在 Key 下方给出 */
+  keyUrl?: string;
   capabilities: LlmLayer[];
   hint: string;
 }
@@ -449,8 +451,10 @@ export const LLM_PARAM_META: Record<
     hint: "变更后需重建 pgvector 索引",
   },
   sampleRate: { label: "采样率（Hz）", kind: "number", step: 1000, min: 1 },
-  ttsVoice: { label: "TTS 音色", kind: "text" },
+  ttsVoice: { label: "面试官音色", kind: "text", hint: "语音层为下拉选择（Andre/Neil/Ethan 等）" },
   ttsModel: { label: "TTS 模型", kind: "text" },
+  languageType: { label: "合成语种", kind: "text", hint: "与题目语种一致发音更准：Chinese / English / Auto" },
+  speed: { label: "语速", kind: "number", step: 0.1, min: 0.5, max: 2 },
 };
 
 /* ---------------- 岗位检索（三期，引擎 B） ---------------- */
@@ -621,4 +625,137 @@ export interface PipelinePatchInput {
   note?: string;
   interviewAt?: string;
   setId?: string;
+}
+
+/* ---------------- 语音模拟面试（五期，文档 3.9） ---------------- */
+
+/** 面试模式：技术 / 行为 / HR / 综合（决定出题维度侧重） */
+export type InterviewMode = "tech" | "behavior" | "hr" | "mixed";
+
+export const INTERVIEW_MODE_LABEL: Record<InterviewMode, string> = {
+  tech: "技术面",
+  behavior: "行为面",
+  hr: "HR 面",
+  mixed: "综合面",
+};
+
+export const INTERVIEW_MODE_HINT: Record<InterviewMode, string> = {
+  tech: "系统设计、接口开发、性能与稳定性等技术深度问题",
+  behavior: "以 STAR 法则考察项目经历、协作与问题解决",
+  hr: "职业动机、稳定性、抗压与团队适配等软性问题",
+  mixed: "技术 + 行为 + HR 混合，最贴近真实面试节奏",
+};
+
+/** 题目维度（与后端 generation 引擎 D 同构） */
+export type InterviewDimension = "STAR" | "技术" | "HR";
+
+/** 动态生成的开放式面试题（JSON 快照，不入题库） */
+export interface InterviewQuestion {
+  stem: string;
+  dimension: InterviewDimension;
+  keywords: string[];
+  followUp: string;
+  suggestSec: number;
+}
+
+/** STAR 四维评分（各维 0~10） */
+export interface StarScores {
+  situation: number;
+  task: number;
+  action: number;
+  result: number;
+}
+
+/** STAR 四维中文标签（评分面板 / 雷达图共用） */
+export const STAR_LABEL: Record<keyof StarScores, string> = {
+  situation: "背景",
+  task: "任务",
+  action: "行动",
+  result: "结果",
+};
+
+/** 单题作答结果（_answer_payload；submit 响应额外带 followUp） */
+export interface InterviewAnswerResult {
+  id: string;
+  sessionId: string;
+  seq: number;
+  question: InterviewQuestion;
+  transcript: string;
+  starScores: StarScores | null;
+  hitKeywords: string[];
+  missedKeywords: string[];
+  comment: string;
+  durationSec: number;
+  hasRecording: boolean;
+  /** 触发的一层追问文本（submit 响应携带；无则 null） */
+  followUp?: string | null;
+}
+
+/** 追问轮次（interview_turns） */
+export interface InterviewTurn {
+  turnNo: number;
+  role: "interviewer" | "candidate";
+  transcript: string;
+}
+
+/** 复盘报告（primary 层生成：四维雷达 + 总评 + 优势 + 改进建议） */
+export interface InterviewReport {
+  overall: number;
+  radar: StarScores;
+  summary: string;
+  strengths: string[];
+  improvements: string[];
+}
+
+/** 会话现场（创建 / GET /{id} 返回，含题目与已答明细） */
+export interface InterviewSession {
+  id: string;
+  mode: InterviewMode;
+  targetJob: string;
+  questions: InterviewQuestion[];
+  status: "running" | "finished";
+  recordAudio: boolean;
+  startedAt: string;
+  finishedAt: string | null;
+  total: number;
+  answered: number;
+  currentSeq: number;
+  report: InterviewReport | null;
+  answers: InterviewAnswerResult[];
+}
+
+/** 历史面试列表项（GET /api/interview-sessions） */
+export interface InterviewListItem {
+  id: string;
+  mode: InterviewMode;
+  targetJob: string;
+  total: number;
+  status: "running" | "finished";
+  startedAt: string;
+  finishedAt: string | null;
+  hasReport: boolean;
+}
+
+/** 语音能力探测（GET /capabilities）：决定走录音还是降级文字、是否展示读题 */
+export interface InterviewCapabilities {
+  asrAvailable: boolean;
+  ttsAvailable: boolean;
+}
+
+/** 复盘报告页数据（_report_payload：每题带追问轮次，开启留存时可回放录音） */
+export interface InterviewReportAnswer extends InterviewAnswerResult {
+  turns: InterviewTurn[];
+}
+
+export interface InterviewReportPayload {
+  id: string;
+  mode: InterviewMode;
+  targetJob: string;
+  status: "running" | "finished";
+  total: number;
+  answered: number;
+  startedAt: string;
+  finishedAt: string | null;
+  report: InterviewReport | null;
+  answers: InterviewReportAnswer[];
 }

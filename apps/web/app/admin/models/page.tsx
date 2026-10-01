@@ -58,6 +58,34 @@ const SOURCE_LABEL: Record<string, string> = {
   none: "未获取到候选",
 };
 
+/**
+ * 语音层（云端 TTS）面试官音色候选：qwen3-tts-flash 系统音色（voice 值区分大小写）。
+ * 默认 Andre 安德雷（沉稳磁性男声）；仅收录普通话音色，方言音色不在此列。
+ */
+const VOICE_OPTIONS: { group: string; items: { value: string; label: string }[] }[] = [
+  {
+    group: "男声",
+    items: [
+      { value: "Andre", label: "Andre 安德雷 · 沉稳磁性（默认）" },
+      { value: "Neil", label: "Neil 阿闻 · 字正腔圆新闻主持" },
+      { value: "Ethan", label: "Ethan 晨煦 · 阳光普通话" },
+      { value: "Ryan", label: "Ryan 甜茶 · 张力戏感" },
+      { value: "Kai", label: "Kai 凯 · 舒缓护耳" },
+      { value: "Moon", label: "Moon 月白 · 率性帅气" },
+      { value: "Vincent", label: "Vincent 田叔 · 沙哑烟嗓" },
+      { value: "Aiden", label: "Aiden 艾登 · 阳光大男孩" },
+    ],
+  },
+  {
+    group: "女声",
+    items: [
+      { value: "Jennifer", label: "Jennifer 詹妮弗 · 电影质感专业女声" },
+      { value: "Katerina", label: "Katerina 卡捷琳娜 · 御姐韵律" },
+      { value: "Elias", label: "Elias 墨讲师 · 严谨叙事" },
+    ],
+  },
+];
+
 /** API Key / base_url 输入停顿后自动拉取模型的防抖时长 */
 const DISCOVER_DEBOUNCE_MS = 700;
 
@@ -380,6 +408,8 @@ export default function AdminModelsPage() {
     configs.forEach((cfg) => {
       const draft = drafts[cfg.layer];
       if (!draft) return;
+      // 语音层模型锁定 qwen3-tts-flash，不做模型发现（DashScope 原生 api/v1 无 /models 列表）
+      if (cfg.layer === "voice") return;
       const provider = providers.find((p) => p.id === draft.provider);
       if (provider?.kind === "local" || provider?.requiresKey === false) return;
       const key = draft.apiKey.trim();
@@ -495,8 +525,8 @@ export default function AdminModelsPage() {
           <span className="ml-auto font-mono text-xs text-muted">{localModels?.modelsDir}</span>
         </header>
         <p className="mt-1.5 text-xs leading-relaxed text-muted">
-          可本地运行的模型（当前为向量模型）下载到项目内后由服务端直接加载调用，不出网、不计费；
-          Embedding 层默认已指向本地模型。权重不入仓，克隆项目后执行一次下载命令即可。
+          可本地运行的模型下载到项目内后由服务端直接加载调用，不出网、不计费：Embedding 层默认指向本地向量模型；
+          语音面试的回答转文字（ASR）用本地 SenseVoice，离线秒级转写、无需 Key。权重不入仓，克隆项目后执行一次下载命令即可。
         </p>
         {!localModels?.models.length ? (
           <div className="mt-3 rounded-btn bg-orange-50 px-3.5 py-2.5 text-xs text-warn">
@@ -518,7 +548,8 @@ export default function AdminModelsPage() {
                 <div className="min-w-0">
                   <p className="font-mono text-xs text-ink">{m.modelId}</p>
                   <p className="mt-0.5 text-xs text-muted">
-                    {m.label} · {m.kind} · dim {m.dimensions ?? "?"} · {m.sizeMB}MB
+                    {m.label} · {m.kind === "asr" ? "语音识别 ASR · 离线无需 Key" : m.kind}
+                    {typeof m.dimensions === "number" ? ` · dim ${m.dimensions}` : ""} · {m.sizeMB}MB
                     {m.downloadedAt ? ` · ${m.downloadedAt}` : ""}
                   </p>
                   <p className="mt-0.5 text-xs leading-relaxed text-muted/80">{m.desc}</p>
@@ -540,6 +571,7 @@ export default function AdminModelsPage() {
           const canRollback = (historyCount[cfg.layer] || 0) > 0;
           const provider = providerOf(draft.provider);
           const isLocal = provider?.kind === "local";
+          const isVoice = cfg.layer === "voice";
           const noKeyNeeded = isLocal || provider?.requiresKey === false;
           const layerUnsupported = provider ? !provider.capabilities.includes(cfg.layer) : false;
           const options = modelOptions[cfg.layer] ?? [];
@@ -591,29 +623,49 @@ export default function AdminModelsPage() {
               <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2">
                 <label className="block">
                   <span className="mb-1.5 block text-xs text-muted">供应商</span>
-                  <select
-                    className="input"
-                    value={draft.provider}
-                    onChange={(e) => onProviderChange(cfg, e.target.value)}
-                  >
-                    {providerOptions.map((p) => (
-                      <option key={p.id} value={p.id}>
-                        {p.label}
-                      </option>
-                    ))}
-                  </select>
+                  {isVoice ? (
+                    // 语音层锁定云端 Qwen3-TTS-Flash：中英混排/数字/% 朗读远好于本地方案，供应商不可改
+                    <div className="input flex items-center justify-between bg-line/30 font-mono text-ink">
+                      <span>{provider?.label || "阿里云百炼（通义千问）"}</span>
+                      <span className="tag bg-brand-light text-brand">已锁定</span>
+                    </div>
+                  ) : (
+                    <select
+                      className="input"
+                      value={draft.provider}
+                      onChange={(e) => onProviderChange(cfg, e.target.value)}
+                    >
+                      {providerOptions.map((p) => (
+                        <option key={p.id} value={p.id}>
+                          {p.label}
+                        </option>
+                      ))}
+                    </select>
+                  )}
                   {provider?.hint && (
                     <span className="mt-1.5 block text-xs leading-relaxed text-muted">
                       {provider.hint}
                     </span>
                   )}
-                  {layerUnsupported && (
+                  {!isVoice && layerUnsupported && (
                     <span className="mt-1 block text-xs text-warn">
                       该供应商未声明承接「{cfg.label}」，保存前请确认模型可用
                     </span>
                   )}
                 </label>
 
+                {isVoice ? (
+                  <div className="block">
+                    <span className="mb-1.5 block text-xs text-muted">模型名</span>
+                    <div className="input flex items-center justify-between bg-line/30 font-mono text-ink">
+                      <span>{draft.modelName || "qwen3-tts-flash"}</span>
+                      <span className="tag bg-brand-light text-brand">已锁定</span>
+                    </div>
+                    <span className="mt-1.5 block text-xs leading-relaxed text-muted">
+                      语音合成锁定 Qwen3-TTS-Flash（面试官读题）；回答转文字走本地 SenseVoice，无需在此配置。
+                    </span>
+                  </div>
+                ) : (
                 <div className="block">
                   <span className="mb-1.5 block text-xs text-muted">模型名（点击展开候选，也可直接输入）</span>
                   <div className="flex gap-2">
@@ -700,6 +752,7 @@ export default function AdminModelsPage() {
                     </span>
                   )}
                 </div>
+                )}
 
                 <label className="block">
                   <span className="mb-1.5 block text-xs text-muted">API Key</span>
@@ -717,9 +770,27 @@ export default function AdminModelsPage() {
                     }
                     onChange={(e) => patchDraft(cfg.layer, { apiKey: e.target.value })}
                   />
-                  {!noKeyNeeded && (
+                  {!noKeyNeeded && !isVoice && (
                     <span className="mt-1.5 block text-xs text-muted">
                       填写后自动拉取该账号可用的模型清单（无需点按钮），也可随时手动输入模型名
+                    </span>
+                  )}
+                  {!noKeyNeeded && provider?.keyUrl && (
+                    <a
+                      className="mt-1.5 inline-flex items-center gap-1 text-xs text-brand hover:underline"
+                      href={provider.keyUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      获取 API Key
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                        <path d="M7 17L17 7M9 7h8v8" strokeLinecap="round" strokeLinejoin="round" />
+                      </svg>
+                    </a>
+                  )}
+                  {isVoice && (
+                    <span className="mt-1.5 block text-xs leading-relaxed text-muted">
+                      阿里云百炼开通即送 11 万字符（约 110 场面试），语音合成按量计费、输出音频免费，Key 填此即可。
                     </span>
                   )}
                 </label>
@@ -729,27 +800,34 @@ export default function AdminModelsPage() {
                   <input
                     className="input font-mono"
                     value={draft.baseUrl}
-                    disabled={isLocal}
+                    disabled={isLocal || isVoice}
                     placeholder={
                       isLocal ? "本地推理，无需 base_url" : "选定供应商后自动填入，可改为自建网关"
                     }
                     onChange={(e) => patchDraft(cfg.layer, { baseUrl: e.target.value })}
                   />
-                  {!isLocal && provider?.baseUrl && draft.baseUrl !== provider.baseUrl && (
+                  {isVoice && (
+                    <span className="mt-1.5 block text-xs leading-relaxed text-muted">
+                      语音合成走 DashScope 原生 api/v1（区别于文本层的 compatible-mode/v1），已锁定。
+                    </span>
+                  )}
+                  {!isVoice && !isLocal && provider?.baseUrl && draft.baseUrl !== provider.baseUrl && (
                     <span className="mt-1.5 block text-xs text-muted">
                       已自定义（{provider.label} 默认：{provider.baseUrl}）
                     </span>
                   )}
                 </label>
-                <label className="block">
-                  <span className="mb-1.5 block text-xs text-muted">降级模型（选填）</span>
-                  <input
-                    className="input font-mono"
-                    value={draft.fallbackModel}
-                    placeholder="主模型超时/限流时自动切换"
-                    onChange={(e) => patchDraft(cfg.layer, { fallbackModel: e.target.value })}
-                  />
-                </label>
+                {!isVoice && (
+                  <label className="block">
+                    <span className="mb-1.5 block text-xs text-muted">降级模型（选填）</span>
+                    <input
+                      className="input font-mono"
+                      value={draft.fallbackModel}
+                      placeholder="主模型超时/限流时自动切换"
+                      onChange={(e) => patchDraft(cfg.layer, { fallbackModel: e.target.value })}
+                    />
+                  </label>
+                )}
                 <div className="flex items-end pb-1">
                   <button
                     className="flex items-center gap-2 text-sm"
@@ -778,6 +856,7 @@ export default function AdminModelsPage() {
               <div className="mt-4 grid grid-cols-2 gap-4 md:grid-cols-4">
                 {Object.keys(draft.params).map((key) => {
                   const meta = LLM_PARAM_META[key];
+                  const isVoiceSelect = isVoice && key === "ttsVoice";
                   return (
                     <label key={key} className="block">
                       <span className="mb-1.5 block text-xs text-muted">
@@ -788,19 +867,41 @@ export default function AdminModelsPage() {
                           </em>
                         )}
                       </span>
-                      <input
-                        className="input font-mono"
-                        type={meta?.kind === "number" ? "number" : "text"}
-                        step={meta?.step}
-                        min={meta?.min}
-                        max={meta?.max}
-                        value={draft.params[key]}
-                        onChange={(e) =>
-                          patchDraft(cfg.layer, {
-                            params: { ...draft.params, [key]: e.target.value },
-                          })
-                        }
-                      />
+                      {isVoiceSelect ? (
+                        <select
+                          className="input"
+                          value={draft.params[key]}
+                          onChange={(e) =>
+                            patchDraft(cfg.layer, {
+                              params: { ...draft.params, [key]: e.target.value },
+                            })
+                          }
+                        >
+                          {VOICE_OPTIONS.map((g) => (
+                            <optgroup key={g.group} label={g.group}>
+                              {g.items.map((v) => (
+                                <option key={v.value} value={v.value}>
+                                  {v.label}
+                                </option>
+                              ))}
+                            </optgroup>
+                          ))}
+                        </select>
+                      ) : (
+                        <input
+                          className="input font-mono"
+                          type={meta?.kind === "number" ? "number" : "text"}
+                          step={meta?.step}
+                          min={meta?.min}
+                          max={meta?.max}
+                          value={draft.params[key]}
+                          onChange={(e) =>
+                            patchDraft(cfg.layer, {
+                              params: { ...draft.params, [key]: e.target.value },
+                            })
+                          }
+                        />
+                      )}
                     </label>
                   );
                 })}

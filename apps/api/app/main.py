@@ -9,6 +9,7 @@ from app.routers import (
     auth,
     daily,
     exams,
+    interview,
     jobs,
     me,
     notifications,
@@ -25,8 +26,8 @@ from app.routers import (
 
 app = FastAPI(
     title=settings.app_name,
-    version="0.4.0",
-    description="AI 面试练习平台 · 三期已交付 + 四期进行中（求职看板 / 引擎 B 两阶段匹配评分漏斗）",
+    version="0.5.0",
+    description="AI 面试练习平台 · 四期已交付 + 五期进行中（语音模拟面试：云端 TTS 读题 / 本地 SenseVoice 转写 / 动态出题 / STAR 评分 / 复盘）",
 )
 
 app.add_middleware(
@@ -51,6 +52,7 @@ app.include_router(resumes.router)
 app.include_router(stats.router)
 app.include_router(jobs.router)
 app.include_router(pipeline.router)
+app.include_router(interview.router)
 app.include_router(notifications.router)
 app.include_router(admin.router)
 

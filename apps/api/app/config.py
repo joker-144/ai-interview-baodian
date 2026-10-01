@@ -33,6 +33,16 @@ class Settings:
     )
     # 本地推理线程数：受限环境（容器/低内存）下按核数预分配会直接 OOM，默认保守取 2
     local_model_threads: int = int(os.getenv("LOCAL_MODEL_THREADS", "2"))
+    # 本地 ASR（SenseVoice）推理线程数：面试实时转写，4 线程实测约 22 倍实时
+    asr_threads: int = int(os.getenv("ASR_THREADS", "4"))
+    # 本地 ASR 模型 id（apps/api/models/<id>/），由 scripts/download_models.py 下载
+    asr_model_id: str = os.getenv(
+        "ASR_MODEL_ID", "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
+    )
+    # 面试录音留存目录（五期）：仅「逐场显式开启」才落盘，gitignored；DB 只存相对路径
+    recordings_dir: str = os.getenv(
+        "RECORDINGS_DIR", str(Path(__file__).resolve().parent.parent / "recordings")
+    )
 
 
 settings = Settings()

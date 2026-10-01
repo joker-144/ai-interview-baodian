@@ -1,5 +1,5 @@
 {
-  "updatedAt": "2026-09-24 11:20:12",
+  "updatedAt": "2026-09-30 17:06:36",
   "models": [
     {
       "modelId": "bge-small-zh-v1.5",
@@ -11,6 +11,17 @@
       "sizeMB": 91.4,
       "downloadedAt": "2026-09-24 11:20:12",
       "desc": "默认向量模型：题目去重 / 知识点检索，CPU 可跑"
+    },
+    {
+      "modelId": "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
+      "repo": "",
+      "kind": "asr",
+      "label": "SenseVoice 语音识别（中/英/日/韩/粤）",
+      "dimensions": null,
+      "path": "apps/api/models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
+      "sizeMB": 228.2,
+      "downloadedAt": "2024-07-18 21:06:54",
+      "desc": "本地 ASR：五期语音模拟面试离线转写，int8 权重，约 22 倍实时"
     }
   ]
 }

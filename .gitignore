@@ -68,3 +68,8 @@ apps/api/config/db.json
 scripts/_*.txt
 scripts/_*.ps1
 scripts/*.png
+
+# 开发期临时脚本（冒烟 / 验收 / 清理，如 smoke_*.py / cleanup_*.py / verify_*.py）：用后即删，不入仓
+apps/api/scripts/smoke_*.py
+apps/api/scripts/cleanup_*.py
+apps/api/scripts/verify_*.py

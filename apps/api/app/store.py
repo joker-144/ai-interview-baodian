@@ -519,6 +519,8 @@ class RuntimeState:
     # 语音模拟面试（五期）：session_id -> 会话 dict（活跃会话内存态，与 db.interview_sessions 同构；
     # 会话内嵌 answers 列表供内存模式兜底，作答/追问逐行双写 db）
     interview_sessions: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # 岗位匹配度报告（六期）：user_id -> [报告行]（倒序最新在前，与 db.jd_reports 同构）
+    jd_reports: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """模型配置 / 历史 / 审计从 config/llm.json 恢复（不存在时由模板复制或走种子）。
@@ -743,6 +745,7 @@ def ensure_user(user_id: str) -> None:
         }
         state.resume_versions[user_id] = db.load_resumes(user_id)
         state.notifications[user_id] = db.load_notifications(user_id)
+        state.jd_reports[user_id] = db.load_jd_reports(user_id)
         # 今日计划懒加载（跨日由 GET /api/plans 按 date 惰性补拉 / 生成）
         state.plans[user_id] = {
             datetime.now().strftime("%Y-%m-%d"): db.load_plans(
@@ -759,6 +762,7 @@ def ensure_user(user_id: str) -> None:
         state.resumes[user_id] = None
         state.resume_versions[user_id] = []
         state.notifications[user_id] = []
+        state.jd_reports[user_id] = []
         state.plans[user_id] = {}
 
 
@@ -1070,6 +1074,7 @@ def persist_set_deletion(user_id: str, set_id: str) -> None:
 
 def purge_user_data(user_id: str) -> None:
     """注销执行：物理清理该用户全部数据行，并清空全站题库（与内存清理对齐）。"""
+    state.jd_reports.pop(user_id, None)
     db.clear_user_data(user_id)
     db.clear_bank()
 
@@ -1158,6 +1163,39 @@ def job_detail_put(security_id: str, keyword: str, payload: dict[str, Any]) -> N
     expires, expires_str = _cache_expiry(JOB_DETAIL_TTL_DAYS)
     state.job_details[security_id] = {"payload": payload, "expiresAt": expires}
     db.save_job_detail(security_id, keyword, payload, expires_str)
+
+
+# ---------------- 岗位匹配度报告（六期：内存镜像 + MySQL 双写） ----------------
+
+
+def add_jd_report(user_id: str, *, set_id: str | None, jd: dict[str, Any], report: dict[str, Any]) -> dict[str, Any]:
+    """匹配度报告落库：内存列表头部插入 + MySQL 一行（同一题集重生成取最新）。"""
+    rec = {
+        "reportId": new_id("jdr"),
+        "userId": user_id,
+        "setId": set_id or "",
+        "jobName": str(jd.get("jobName") or "")[:64],
+        "brand": str(jd.get("brand") or "")[:64],
+        "matchScore": int(report.get("matchScore") or 0),
+        "report": report,
+        "createdAt": now_str(),
+    }
+    reports = state.jd_reports.setdefault(user_id, [])
+    reports[:] = [r for r in reports if r.get("setId") != rec["setId"]]
+    reports.insert(0, rec)
+    db.save_jd_report(rec)
+    return rec
+
+
+def jd_report_by_set(user_id: str, set_id: str) -> dict[str, Any] | None:
+    """题集关联的最近一份匹配度报告（内存 -> db 回源并回填）。"""
+    for rec in state.jd_reports.get(user_id, []):
+        if rec.get("setId") == set_id:
+            return rec
+    rec = db.load_jd_report_by_set(user_id, set_id)
+    if rec is not None:
+        state.jd_reports.setdefault(user_id, []).insert(0, rec)
+    return rec
 
 
 def job_map_get(map_key: str) -> dict[str, Any] | None:

@@ -212,7 +212,8 @@ export class WavPlayer {
   stop(): void {
     if (this.source) {
       try {
-        this.source.onended = null;
+        // 不摘除 onended：src.stop() 会触发 ended，让挂起的 play() Promise 正常 resolve
+        // （文档约定「resolve 于播放自然结束或被 stop 打断」，摘除会让其永不 resolve）
         this.source.stop();
         this.source.disconnect();
       } catch {

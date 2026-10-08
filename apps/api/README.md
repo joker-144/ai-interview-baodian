@@ -112,7 +112,7 @@ python scripts/download_models.py --model sherpa-onnx-sense-voice-zh-en-ja-ko-yu
 | GET / POST | /api/question-sets | 题集列表 / 新建题集 |
 | GET / DELETE | /api/question-sets/{set_id} | 题集详情 / 删除题集（级联清理进度与错题） |
 | GET | /api/question-sets/{set_id}/questions | 题集内题目 |
-| POST | /api/question-sets/generate | 触发出题（统一入口，body: `{source, resumeId?, settings:{count, difficulty, with_answer}}`；`source` 三通道 = `resume` 简历驱动 / `job_search` 岗位市场级 / `jd_target` 单岗位专属。注：此处「三通道」指**出题来源**，与引擎 C 的**输入**三通道（粘贴链接 / 上传截图 / 粘贴文本）不是同一概念，后者属六期未实现） |
+| POST | /api/question-sets/generate | 触发出题（统一入口，body: `{source, resumeId?, settings:{count, difficulty, with_answer}}`；`source` 三通道 = `resume` 简历驱动 / `job_search` 岗位市场级 / `jd_target` 单岗位专属。注：此处「三通道」指**出题来源**，与引擎 C 的**输入**三通道（粘贴链接 / 上传截图 / 粘贴文本，六期已实现，见 `/api/jd/parse`）不是同一概念） |
 | GET | /api/question-sets/{task_id}/stream | SSE 流式出题进度（观察者，断开不影响生成） |
 | GET | /api/question-sets/{task_id}/progress | 轮询兜底 |
 | GET | /api/questions | 题目列表（按 setId 过滤） |
@@ -159,7 +159,10 @@ python scripts/download_models.py --model sherpa-onnx-sense-voice-zh-en-ja-ko-yu
 | GET | /api/jobs/{security_id}/detail | 【三期】单岗位全量 JD（job_details 缓存 7 天） |
 | GET | /api/jobs/map | 【三期】岗位考点地图：TOP10 技能榜 + 高频职责 + 薪资洞察 + 三档分布（job_maps 缓存 7 天，与生成设置解耦）；未生成过 404 引导 |
 | POST | /api/question-sets/generate（source=job_search） | 【三期/四期】引擎 B 出题：【四期】两阶段漏斗（Stage1 词法预筛 top-K → 仅对 K 抓 JD 详情 → Stage2 LLM 深度评分产出 0~100 匹配分，失败降级词法分）→ 聚合分析仅喂 top-M（失败降级规则版词频榜）→ 三档分批出题（必备高频 50%/加分项 30%/差异化 20%）；匹配分并入 /api/jobs/map；复用 stream/progress 与 generate_done 站内信 |
-| POST | /api/question-sets/generate（source=jd_target） | 【四期增补】引擎 C（子集）单岗位专属出题（求职看板 zhipin 卡一键生成）：settings.securityId 必填（缺失 422）；题集按岗位名归并「{jobName} · 岗位专属预测题」（默认 30 题，显式 count 优先）；发起即挂接本人看板卡 setId（看板卡即刻显示该题集与进度）；后台取单份 JD（job_details 缓存 7 天，未命中节流抓取）→ 六维覆盖规划分批出题（复用引擎 A/B 复判/去重/落库骨架）；JD 不可得时任务降级 error 不污染看板；复用 stream/progress 与 generate_done 站内信 |
+| POST | /api/question-sets/generate（source=jd_target） | 【四期增补/六期扩展】引擎 C 单岗位专属出题：settings.securityId（link 通道必填）或 settings.jd（截图/文本通道由 `/api/jd/parse` 产出的内联 JD，六期）；settings.inputChannel 分派（link/screenshot/text，六期）、useResume「结合我的简历生成」开关（默认 true）、remedialTopics 缺口补强题包主题（六期）、cardId 显式挂接看板卡（六期，优先于 securityId 匹配，看板手动卡/外部平台卡入口）；题集按岗位名归并「{jobName} · 岗位专属预测题」（默认 30 题，显式 count 优先）；发起即挂接本人看板卡 setId；后台取单份 JD（job_details 缓存 7 天，未命中节流抓取；内联 JD 跳过抓取）→ 六维覆盖规划分批出题（复用引擎 A/B 复判/去重/落库骨架）；JD 不可得时任务降级 error 不污染看板；复用 stream/progress 与 generate_done 站内信；出题成功且有实质简历时随任务落匹配度报告（六期，见 `/api/jd/match-report`） |
+| POST | /api/jd/parse | 【六期】引擎 C 三通道统一解析（body `{channel, url?, imageBase64?, text?}`）：link=BOSS URL 提 security_id → job_detail（7 天缓存）；screenshot=vision 分层多模态提取（data URI ≤9MB）→ boss search 反查锁定（公司+岗位双命中），未命中/失败降级视觉结果不阻断（出参 retrievalMatched=false）；text=primary 层 LLM 结构化（≥50 字，终极兜底，不触达平台）。产出统一结构化 JD `{jobName, brand, city, salary, experience, skills[], desc, channel, securityId?}` |
+| POST | /api/jd/match-report | 【六期】即时岗位匹配度评估（不落库；需已上传简历，否则 422）：JD×简历 → 匹配分 0~100 + summary + 强匹配/弱匹配/能力缺口三分类（strong 含 evidence、weak/gap 含 advice） |
+| GET | /api/jd/match-report?setId= | 【六期】题集关联的匹配度报告回看（出题时随「结合我的简历生成」产出并落 `jd_reports` 表；无报告 404 引导重出） |
 | GET | /api/daily-practice | 【三期】当日每日一练：首访惰性生成 10 题（薄弱 60% + 随机 40%，不调 LLM，快照当日不变） |
 | POST | /api/daily-practice/progress | 【三期】标记一题完成（判分走 /api/practice/submit 原链路）；全部完成且今日未打卡 → streak+1（lastCheckinDate 同日去重） |
 | GET | /api/pipeline | 【四期】求职看板四列（已投递/笔试/面试/Offer，排除回收站）+ 趋势统计（各阶段计数/本周新增/待面试/平均匹配分）；顺带惰性触发面试临近提醒 |
@@ -234,7 +237,7 @@ python scripts/download_models.py --model sherpa-onnx-sense-voice-zh-en-ja-ko-yu
 >
 > **范围边界（对齐产品文档第六章 V2.11 排期口径）**：四期实际交付 = 引擎 B 两阶段匹配评分漏斗 + 求职看板四列状态机 + **引擎 C 子集**（仅「已检索 JD」一条输入路径）。
 > 原挂在四期、V2.10 顺延至五期的「引擎 C 完整三通道（粘贴 BOSS 链接 / 上传岗位截图 / 粘贴 JD 文本）+ 岗位匹配度报告（JD×简历 匹配分 + 强/弱匹配 + 缺口→补强突击题包）+ 『结合我的简历生成』开关 + 掌握度图谱」，
-> **V2.11 再行拆期**：五期实际仅交付「语音模拟面试」（本地 ASR + 云端 TTS + 动态出题 + STAR 评分 + 复盘 + 合规录音），上述引擎 C 完整通道与匹配度报告**拆至六期、后端当前未实现**（无对应路由与表；前端 `apps/web/app/jd/page.tsx` 仅为 `ComingSoon` 占位页）；掌握度图谱入 6.6 远期；拆段理由与处置建议见文档 6.2 / 6.5 第 7 条。
+> **V2.11 再行拆期**：五期实际仅交付「语音模拟面试」（本地 ASR + 云端 TTS + 动态出题 + STAR 评分 + 复盘 + 合规录音），上述引擎 C 完整通道与匹配度报告**拆至六期**；六期已交付（`/api/jd/parse` 三通道 + `/api/jd/match-report` 报告 + generate inputChannel/useResume/remedialTopics/cardId 扩展 + 前端 `/jd` 页与看板手动卡「JD 定制出题」入口，新表 `jd_reports`）；掌握度图谱入 6.6 远期；拆段理由与处置建议见文档 6.2 / 6.5 第 7 条。
 
 ## 分期落地状态（对齐产品文档第六章 V2.11）
 
@@ -245,14 +248,16 @@ python scripts/download_models.py --model sherpa-onnx-sense-voice-zh-en-ja-ko-yu
 | 三期 W8~W10 | 引擎 B 岗位市场（boss-agent-cli 只读检索 + 分层采样 + 异常矩阵映射）、考点地图 `/api/jobs/map`、每日一练、`generate source=job_search`、三层缓存（`jobs_cache` / `job_details` / `job_maps`） | ✅ 已交付 |
 | 四期 W11~W13 | 引擎 B **两阶段匹配评分漏斗**（Stage1 词法预筛 top-K 无 LLM → 仅对 K 抓 JD 详情 → Stage2 LLM 产出 0~100 匹配分 + 理由，失败降级词法分不阻断；匹配分并入考点地图 `jobScores` 并回填看板卡）、求职看板 `/api/pipeline*`（四列状态机 / 回收站 / 趋势统计 / 面试临近提醒）、**引擎 C 子集** `generate source=jd_target`（单岗位专属预测题，看板一键生成 + 发起即挂接卡 setId）、检索卡「岗位要求」可折叠区、检索缓存 TTL 收紧为 1 天 | ✅ 已交付（引擎 C 仅子集） |
 | 五期 W14~W15 | Web 语音模拟面试：**本地 ASR**（`asr.py` SenseVoice-Small int8 / sherpa-onnx 离线整段转写）、**云端 TTS**（`tts.py` Qwen3-TTS-Flash / DashScope 裸 HTTP）、**动态出题**（`generation.generate_interview_questions` 按简历+岗位实时生成、不落题库）、面试路由（`/api/interview-sessions*`：创建/进度/capabilities/tts/作答/追问/finish/report/audio/删除）、STAR 四维实时评估 + 命中关键词 + 一层追问 + 四维雷达复盘、录音逐场显式开启/回放/级联清理、无麦克风/弱网/ASR 未下载降级文字 | ✅ 已交付 |
-| 六期（待排期） | **引擎 C 完整三通道**（粘贴链接解析 security_id / 上传截图多模态解析 / 粘贴文本 LLM 结构化，复用同一 `source=jd_target` 并在 settings 增 `inputChannel` 分派）、**岗位匹配度报告**（JD×简历 匹配分 + 强/弱匹配 + 缺口→补强突击题包）、**「结合我的简历生成」开关**（自五期拆出，掌握度图谱入产品文档 6.6 远期） | ⬜ 未开始 |
+| 六期 W15~W16 | **引擎 C 完整三通道**（`/api/jd/parse`：粘贴链接解析 security_id / 上传截图 vision 多模态提取 + boss search 反查锁定（失败降级视觉结果）/ 粘贴文本 LLM 结构化兜底，统一产出结构化 JD；generate settings 增 `inputChannel` 分派 + 内联 JD + `cardId` 显式挂接看板手动卡）、**岗位匹配度报告**（`/api/jd/match-report`：JD×简历 匹配分 0~100 + 强/弱匹配/能力缺口三分类；即时预览不落库 + 出题联动落 `jd_reports` 可回看；弱项/缺口勾选 → `remedialTopics` 补强突击题包）、**「结合我的简历生成」开关**（`useResume` 默认开，出题注入简历上下文 + 联动产出完整报告）、前端 `/jd` 页（三 tab + 解析面板 + 匹配度徽章 + 报告三分类 + 补强题包 + SSE 进度）与看板手动卡「JD 定制出题」入口 | ✅ 已交付（掌握度图谱入产品文档 6.6 远期） |
 | App A1~A3 W16~W22 | 小程序 / 移动端（复用本 API，不新增后端能力） | ⬜ 未开始 |
 
 > **口径不得混用**：`/api/jobs/map` 返回的 `jobScores`（`{securityId: {score, reason}}`）是**引擎 B 的市场级**匹配分——按「关键词 + 城市」批量评分、用于岗位卡「匹配 N%」与看板回填；
-> 六期「岗位匹配度报告」是**单岗位 JD×简历**的逐条强匹配 / 弱匹配 / 缺口三分类 + 缺口题包，产物模型与展示页均需新建，二者不是同一东西，接口与文档表述都不得互相替代。
+> 六期「岗位匹配度报告」（`/api/jd/match-report`）是**单岗位 JD×简历**的逐条强匹配 / 弱匹配 / 缺口三分类 + 缺口题包，二者不是同一东西，接口与文档表述都不得互相替代。
 >
-> **六期可复用点（已就绪）**：`generate` 的 `source=jd_target` 出题骨架（六维规划 + 复判 + 去重 + 落库 + SSE 进度）、题集按岗位名归并、看板卡 setId 挂接口径、`job_details` 单卡惰性抓取与 7 天缓存、notifications 站内信机制。
-> **六期需新建（当前不存在）**：图片上传与多模态解析、`inputChannel` 分派、匹配度报告产物模型与表、掌握度图谱聚合（语音链路已于五期交付，不再列入）。
+> **六期交付口径（实测）**：三通道解析 + 匹配度报告 + 出题联动（useResume/remedialTopics/cardId）+ 前端 `/jd` 页均已完成端到端验收
+> （text 通道 E2E、screenshot 通道视觉提取 + 反查降级 + 422 友好提示、cardId 挂接闭环 card.setId==setId、浏览器 UI 走查 5 项全过、console 无业务错误）；
+> 新表 `jd_reports`（report_id PK / idx_user / idx_set，同 setId 覆盖式插入，注销级联清理），已同步 `sql/schema.sql`；
+> 复用了 `source=jd_target` 出题骨架（六维规划 + 复判 + 去重 + 落库 + SSE）、题集按岗位名归并、看板卡 setId 挂接、`job_details` 7 天缓存、notifications 站内信。
 > 注：`app/models.py` 里的 `follow_up_json` / `resume_anchor` / `jd_anchor` 等列属 SQLAlchemy **预留定义**（该文件未参与实际建表，真实 DDL 在 `sql/schema.sql`），不可当作已落地能力引用。
 
 ## 岗位检索环境准备（三期，引擎 B）

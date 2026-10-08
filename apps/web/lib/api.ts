@@ -52,6 +52,11 @@ import type {
   ResumeAnalysis,
   ResumeCheckup,
   ResumeVersion,
+  JdInfo,
+  JdInputChannel,
+  JdMatchReport,
+  JdParseResult,
+  SetJdMatchReport,
   UserProfile,
   UserSettings,
   WeekOverview,
@@ -808,6 +813,61 @@ export async function startJobDetailGenerate(params: {
 export async function getJobMap(keyword: string, city = ""): Promise<JobMap> {
   const query = new URLSearchParams({ keyword, city });
   return apiFetch<JobMap>(`/api/jobs/map?${query.toString()}`);
+}
+
+/* ---------------- JD 精准定制（引擎 C 六期，文档 3.6 / 原型 P5） ---------------- */
+
+/** 三通道解析：粘贴链接（BOSS 岗位 URL）/ 上传截图（data URI）/ 粘贴文本 */
+export async function parseJd(input: {
+  channel: JdInputChannel;
+  url?: string;
+  imageBase64?: string;
+  text?: string;
+}): Promise<JdParseResult> {
+  return post<JdParseResult>("/api/jd/parse", input);
+}
+
+/** 即时岗位匹配度评估（解析面板徽章/预览，不落库；需已上传简历） */
+export async function getJdMatchReport(jd: JdInfo): Promise<JdMatchReport> {
+  const res = await post<{ report: JdMatchReport }>("/api/jd/match-report", { jd });
+  return res.report;
+}
+
+/** 题集关联的匹配度报告（出题时随「结合我的简历生成」产出，落库可回看） */
+export async function getSetJdMatchReport(setId: string): Promise<SetJdMatchReport> {
+  return apiFetch<SetJdMatchReport>(`/api/jd/match-report?setId=${encodeURIComponent(setId)}`);
+}
+
+/** 引擎 C 六期出题：三通道统一入口（链接传 securityId；截图/文本传解析产出的内联 JD） */
+export async function startJdCustomGenerate(params: {
+  inputChannel: JdInputChannel;
+  securityId?: string;
+  jd?: JdInfo;
+  jobName: string;
+  useResume: boolean;
+  count: number;
+  difficulty: string;
+  withAnswer: boolean;
+  remedialTopics?: string[];
+  /** 显式挂接的看板卡 id（JD 页「挂到看板手动卡」，优先于 securityId 匹配） */
+  cardId?: string;
+}): Promise<string> {
+  const res = await post<{ taskId: string }>("/api/question-sets/generate", {
+    source: "jd_target",
+    settings: {
+      inputChannel: params.inputChannel,
+      securityId: params.securityId ?? "",
+      jd: params.jd,
+      jobName: params.jobName,
+      useResume: params.useResume,
+      count: params.count,
+      difficulty: params.difficulty,
+      withAnswer: params.withAnswer,
+      remedialTopics: params.remedialTopics ?? [],
+      cardId: params.cardId ?? "",
+    },
+  });
+  return res.taskId;
 }
 
 /* ---------------- 每日一练（三期） ---------------- */

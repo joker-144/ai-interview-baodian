@@ -155,15 +155,37 @@ async def start_generate(
     req = body or GenerateRequest()
     total = _resolve_total(req, user_id)
 
-    # 引擎 C（子集）单岗位专属题：securityId 必填；提前解析 jobName 供题集标题与看板挂接
+    # 引擎 C 单岗位专属题（六期三通道）：链接通道 securityId 必填；截图/文本通道带内联 JD
     jd_security_id = ""
     jd_job_name = ""
+    jd_inline = None
     if req.source == "jd_target":
         settings = req.settings or {}
-        jd_security_id = str(settings.get("securityId") or "").strip()
-        if not jd_security_id:
-            raise HTTPException(status_code=422, detail="单岗位专属出题需要提供 securityId（目标岗位）")
-        jd_job_name = _resolve_job_name(user_id, jd_security_id, settings)
+        input_channel = str(settings.get("inputChannel") or "link").strip() or "link"
+        if input_channel == "link":
+            jd_security_id = str(settings.get("securityId") or "").strip()
+            if not jd_security_id:
+                raise HTTPException(status_code=422, detail="单岗位专属出题需要提供 securityId（目标岗位）")
+            jd_job_name = _resolve_job_name(user_id, jd_security_id, settings)
+        else:
+            # 截图/文本通道：/api/jd/parse 产出的结构化 JD 内联传入（不触达平台）
+            inline = settings.get("jd") if isinstance(settings.get("jd"), dict) else None
+            job_name = str((inline or {}).get("jobName") or "").strip()
+            desc = str((inline or {}).get("desc") or "").strip()
+            if not job_name or len(desc) < 20:
+                raise HTTPException(status_code=422, detail="内联 JD 缺失：请先在「JD 精准定制」页完成解析再出题")
+            jd_inline = {
+                "jobName": job_name[:64],
+                "brand": str(inline.get("brand") or "").strip()[:64],
+                "city": str(inline.get("city") or "").strip()[:32],
+                "salary": str(inline.get("salary") or "").strip()[:32],
+                "experience": str(inline.get("experience") or "").strip()[:32],
+                "skills": [str(s).strip()[:24] for s in (inline.get("skills") or []) if str(s or "").strip()][:8],
+                "desc": desc[:2000],
+            }
+            jd_job_name = jd_inline["jobName"]
+            # 截图通道反查命中时携带 securityId（可挂看板卡）；文本通道为空
+            jd_security_id = str(settings.get("securityId") or "").strip()
         req.settings = {**settings, "securityId": jd_security_id, "jobName": jd_job_name}
 
     target_set = _resolve_set(req, user_id)
@@ -201,23 +223,38 @@ async def start_generate(
             },
         )
     elif req.source == "jd_target":
-        # 立即挂接看板卡：使看板卡即刻显示该专属题集与进度（融合闭环）
-        for card in store.pipeline_cards(user_id):
-            if card.get("securityId") == jd_security_id and not card.get("inTrash"):
-                card["setId"] = target_set["id"]
-                store.pipeline_save(user_id, card)
-                break
         settings = req.settings or {}
+        # 立即挂接看板卡（融合闭环）：显式 cardId 优先（JD 页「挂到看板手动卡」），
+        # 否则链接/截图反查通道按 securityId 匹配；两者皆无则跳过
+        card_id = str(settings.get("cardId") or "").strip()
+        if card_id:
+            for card in store.pipeline_cards(user_id):
+                if card.get("id") == card_id and not card.get("inTrash"):
+                    card["setId"] = target_set["id"]
+                    store.pipeline_save(user_id, card)
+                    break
+        elif jd_security_id:
+            for card in store.pipeline_cards(user_id):
+                if card.get("securityId") == jd_security_id and not card.get("inTrash"):
+                    card["setId"] = target_set["id"]
+                    store.pipeline_save(user_id, card)
+                    break
         generation.start_job_detail(
             task,
             target_set["id"],
             {
                 "securityId": jd_security_id,
+                "jd": jd_inline,
                 "keyword": str(settings.get("keyword") or "").strip(),
                 "city": str(settings.get("city") or "").strip(),
                 "jobName": jd_job_name,
                 "difficulty": str(settings.get("difficulty") or "混合"),
                 "withAnswer": bool(settings.get("withAnswer", True)),
+                "useResume": bool(settings.get("useResume", True)),
+                "remedialTopics": [
+                    str(t).strip() for t in (settings.get("remedialTopics") or [])
+                    if str(t or "").strip()
+                ][:6],
             },
         )
     else:

@@ -537,6 +537,59 @@ export interface JobMap {
   dataSource?: string;
 }
 
+/* ---------------- JD 精准定制（引擎 C 六期，文档 3.6 / 原型 P5） ---------------- */
+
+/** 输入通道：粘贴链接 / 上传截图 / 粘贴文本（settings.inputChannel 同口径） */
+export type JdInputChannel = "link" | "screenshot" | "text";
+
+/** 三通道解析产出的结构化 JD（POST /api/jd/parse） */
+export interface JdInfo {
+  jobName: string;
+  brand: string;
+  city: string;
+  salary: string;
+  experience: string;
+  skills: string[];
+  desc: string;
+  channel: JdInputChannel;
+  /** 链接通道 / 截图反查命中时携带（可挂接看板卡） */
+  securityId?: string;
+}
+
+export interface JdParseResult {
+  jd: JdInfo;
+  /** 截图通道反查锁定目标岗位为 true（false = 用视觉提取结果降级） */
+  retrievalMatched: boolean;
+}
+
+/** 匹配度报告三分类条目（strong 有 evidence；weak/gap 有 advice） */
+export interface JdMatchItem {
+  item: string;
+  evidence?: string;
+  advice?: string;
+}
+
+/** 岗位匹配度报告（JD×简历深度评估，与引擎 B 市场级 jobScores 口径不同） */
+export interface JdMatchReport {
+  matchScore: number;
+  summary: string;
+  strong: JdMatchItem[];
+  weak: JdMatchItem[];
+  gap: JdMatchItem[];
+}
+
+/** GET /api/jd/match-report?setId=：题集关联报告（出题联动落库，可回看） */
+export interface SetJdMatchReport {
+  reportId: string;
+  setId: string;
+  jobName: string;
+  brand: string;
+  matchScore: number;
+  report: JdMatchReport;
+  createdAt: string;
+  persisted: boolean;
+}
+
 /* ---------------- 每日一练（三期） ---------------- */
 
 /** 当日每日一练（GET /api/daily-practice，首次访问后端惰性生成 10 题） */

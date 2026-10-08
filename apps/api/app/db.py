@@ -1219,6 +1219,7 @@ def clear_user_data(user_id: str) -> None:
                 "DELETE FROM notifications WHERE user_id = %s",
                 "DELETE FROM daily_practices WHERE user_id = %s",
                 "DELETE FROM job_pipeline WHERE user_id = %s",
+                "DELETE FROM jd_reports WHERE user_id = %s",
                 "DELETE t FROM interview_turns t "
                 "JOIN interview_answers a ON a.id = t.answer_id "
                 "JOIN interview_sessions s ON s.id = a.session_id WHERE s.user_id = %s",
@@ -1529,6 +1530,81 @@ def load_job_map(map_key: str) -> Any | None:
         _warn(f"考点地图缓存读库失败：{exc}")
         return None
     return json.loads(row[0]) if row and row[0] else None
+
+
+# ---------------- 岗位匹配度报告（六期：jd_reports） ----------------
+
+
+def _jd_report_row(row: tuple) -> dict:
+    """jd_reports 行 -> 内存同构 dict（report_json 展开）。"""
+    return {
+        "reportId": row[0],
+        "userId": row[1],
+        "setId": row[2] or "",
+        "jobName": row[3] or "",
+        "brand": row[4] or "",
+        "matchScore": int(row[5] or 0),
+        "report": json.loads(row[6]) if row[6] else {},
+        "createdAt": str(row[7] or ""),
+    }
+
+
+def save_jd_report(rec: dict) -> None:
+    """匹配度报告写一行（报告随出题任务产出，同一题集重生成时覆盖最新一份）。"""
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO jd_reports (report_id, user_id, set_id, job_name, brand, "
+                "match_score, report_json, created_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+                "ON DUPLICATE KEY UPDATE match_score = VALUES(match_score), "
+                "report_json = VALUES(report_json), created_at = VALUES(created_at)",
+                (
+                    rec["reportId"], rec["userId"], rec.get("setId") or "",
+                    rec.get("jobName", ""), rec.get("brand", ""),
+                    int(rec.get("matchScore") or 0),
+                    json.dumps(rec.get("report") or {}, ensure_ascii=False),
+                    rec.get("createdAt", ""),
+                ),
+            )
+    except Exception as exc:
+        _warn(f"匹配度报告写库失败：{exc}")
+
+
+def load_jd_reports(user_id: str) -> list[dict]:
+    """该用户全部报告（created_at 倒序）；供登录时回填内存。"""
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT report_id, user_id, set_id, job_name, brand, match_score, "
+                "report_json, created_at FROM jd_reports WHERE user_id = %s "
+                "ORDER BY created_at DESC",
+                (user_id,),
+            )
+            rows = cur.fetchall()
+    except Exception as exc:
+        _warn(f"匹配度报告读库失败：{exc}")
+        return []
+    return [_jd_report_row(r) for r in rows]
+
+
+def load_jd_report_by_set(user_id: str, set_id: str) -> dict | None:
+    """该用户某题集最近一份报告（内存未命中时 db 回源）。"""
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT report_id, user_id, set_id, job_name, brand, match_score, "
+                "report_json, created_at FROM jd_reports "
+                "WHERE user_id = %s AND set_id = %s ORDER BY created_at DESC LIMIT 1",
+                (user_id, set_id),
+            )
+            row = cur.fetchone()
+    except Exception as exc:
+        _warn(f"匹配度报告读库失败：{exc}")
+        return None
+    return _jd_report_row(row) if row else None
 
 
 def save_daily_practice(

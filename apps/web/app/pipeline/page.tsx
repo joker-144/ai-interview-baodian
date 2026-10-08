@@ -9,6 +9,8 @@
  *
  * 单岗位专属预测题（四期增补，引擎 C 子集）：zhipin 卡上「生成专属预测题」按设置
  * （题量/难度/附答案）触发 source=jd_target 出题，SSE 卡级进度，完成后题集自动挂接本卡。
+ * 手动卡 / 外部平台卡（六期）：「JD 定制出题」跳 /jd?cardId=，经粘贴文本等三通道
+ * 出专属题，题集自动挂接本卡。
  *
  * 合规红线：本页是纯本地状态机——状态流转与 HR 回复备注均由用户手动维护，平台不代投递、
  * 不打招呼、不监听 HR。面试日期临近时后端惰性补一条 interview_prep 复习提醒（当日去重）。
@@ -86,7 +88,7 @@ function CardView({
   const prev = idx > 0 ? STAGES[idx - 1] : null;
   const next = idx < STAGES.length - 1 ? STAGES[idx + 1] : null;
   const plat = PLATFORM_META[card.platform] ?? PLATFORM_META.manual;
-  // 已有题（setId + 题量>0）→「去练习 / 重新生成」；仅 zhipin 卡可生成（手动卡降级）
+  // 已有题（setId + 题量>0）→「去练习 / 重新生成」；zhipin 卡直接生成，手动卡走 /jd 三通道（六期）
   const hasQuestions = Boolean(card.setId) && card.practice.total > 0;
   const percent = genProgress
     ? Math.min(100, Math.round((genProgress.generated / Math.max(genProgress.total, 1)) * 100))
@@ -147,7 +149,14 @@ function CardView({
           </div>
         </div>
       ) : !card.securityId ? (
-        <p className="mt-2 text-xs text-muted/70">未挂接定向题库</p>
+        // 手动卡 / 外部平台卡：无 securityId 不能直接拉 JD，跳 /jd 三通道定制出题（题集自动挂接本卡）
+        <Link
+          href={`/jd?cardId=${card.id}`}
+          title="粘贴该岗位 JD（文本 / 截图 / 链接），生成定向题库并自动挂接本卡"
+          className="mt-2 block w-full rounded-btn border border-brand px-2 py-1.5 text-center text-xs font-medium text-brand hover:bg-brand-light"
+        >
+          JD 定制出题
+        </Link>
       ) : null}
       {card.securityId &&
         (generating && genProgress ? (
@@ -531,7 +540,8 @@ export default function PipelinePage() {
           <div className="card max-h-[88vh] w-full max-w-md overflow-y-auto p-6" onClick={(e) => e.stopPropagation()}>
             <h3 className="text-base font-semibold">手动录入岗位</h3>
             <p className="mt-1 text-xs text-muted">
-              用于记录智联 / 前程无忧 / 猎聘等外部平台岗位；手动卡不自动回填匹配分与题库。
+              用于记录智联 / 前程无忧 / 猎聘等外部平台岗位；手动卡不自动回填匹配分，可通过卡片上「JD
+              定制出题」粘贴该岗位 JD 生成定向题库。
             </p>
 
             <label className="mt-4 block text-sm text-muted">岗位名 *</label>

@@ -241,6 +241,7 @@ export function InterviewRun({
     try {
       const blob = await synthesizeInterviewTts(session.id, text ? { text } : { seq });
       playerRef.current?.stop();
+      setTtsLoading(false); // 合成完成即退出 loading：播放期展示「停止读题」且可点击中断
       setTtsPlaying(true);
       await player.play(blob);
     } catch (e) {

@@ -10,6 +10,7 @@ from app.routers import (
     daily,
     exams,
     interview,
+    jd,
     jobs,
     me,
     notifications,
@@ -51,6 +52,7 @@ app.include_router(wrong_book.router)
 app.include_router(resumes.router)
 app.include_router(stats.router)
 app.include_router(jobs.router)
+app.include_router(jd.router)
 app.include_router(pipeline.router)
 app.include_router(interview.router)
 app.include_router(notifications.router)

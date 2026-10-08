@@ -856,8 +856,12 @@ async def _generate_jd_batch(
     with_answer: bool,
     resume_context: str,
     user_id: str,
+    remedial_topics: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """单岗位专属单批出题：紧扣该 JD 要求、按维度预测面试问题。"""
+    """单岗位专属单批出题：紧扣该 JD 要求、按维度预测面试问题。
+
+    remedial_topics 非空时为「缺口补强题包」：题干聚焦给定的弱匹配/缺口主题。
+    """
     avoid_hint = ""
     if avoid:
         avoid_hint = "\n\n以下题干已存在，请勿重复或高度相似：\n" + "\n".join(f"- {s[:60]}" for s in avoid[-20:])
@@ -867,12 +871,18 @@ async def _generate_jd_batch(
         level = {"L1": 1, "L2": 2, "L3": 3}.get(difficulty, 2)
         difficulty_hint = f"全部题目 difficulty 固定为 {level} 档。"
     answer_hint = "" if with_answer else "\nreferenceAnswer 字段一律输出空字符串。"
+    remedial_hint = ""
+    if remedial_topics:
+        remedial_hint = (
+            "\n\n本次为「岗位缺口补强题包」：候选人在该岗位存在明确短板，"
+            f"题干必须重点考察以下主题（覆盖面按维度铺开，但考点聚焦这些主题）：{'、'.join(remedial_topics)}"
+        )
 
     user_prompt = (
         f"目标岗位 JD：\n{_jd_context_text(jd)}\n\n"
         f"本次请生成 {count} 道题，全部聚焦「{dimension}」这一维度，"
         f"紧扣上述 JD 的职责与要求预测该岗位面试问题。"
-        f"{difficulty_hint}{answer_hint}"
+        f"{difficulty_hint}{answer_hint}{remedial_hint}"
         + (f"\n\n候选人画像（供结合个人情况出题）：\n{resume_context}" if resume_context else "")
         + avoid_hint
     )
@@ -900,34 +910,62 @@ async def _generate_jd_batch(
 async def run_generation_job_detail(
     task: store.GenerateTask, set_id: str, ctx: dict[str, Any]
 ) -> None:
-    """引擎 C（子集）后台任务：取单岗位 JD -> 六维规划分批出专属预测题。
+    """引擎 C 后台任务：单岗位 JD -> 六维规划分批出专属预测题（六期扩展）。
 
-    复用引擎 A/B 的复判 / 去重 / 落库与进度口径；JD 走 detail 缓存（7 天）。
+    - 链接通道（ctx.securityId）：JD 走 detail 缓存（7 天；未命中节流抓取）；
+    - 截图/文本通道（ctx.jd）：直接用 /api/jd/parse 产出的内联结构化 JD，不触达平台；
+    - useResume=False：不注入简历画像（「结合我的简历生成」开关关闭）；
+    - remedialTopics：缺口补强题包（匹配度报告的弱匹配/缺口主题一键生成）；
+    - 出题成功且 useResume 且有简历：额外生成岗位匹配度报告落库（挂题集）。
     """
     from app import boss_cli
 
-    security_id: str = ctx["securityId"]
+    security_id: str = str(ctx.get("securityId") or "").strip()
+    inline_jd = ctx.get("jd") if isinstance(ctx.get("jd"), dict) else None
     difficulty: str = ctx.get("difficulty", "混合")
     with_answer: bool = bool(ctx.get("withAnswer", True))
+    use_resume: bool = bool(ctx.get("useResume", True))
+    remedial_topics = [
+        str(t).strip()[:40] for t in (ctx.get("remedialTopics") or [])
+        if str(t or "").strip()
+    ][:6]
+    jd: dict[str, Any] | None = None
     try:
-        # ① 取单岗位 JD（缓存 7 天；未命中则节流抓取）
-        detail = store.job_detail_get(security_id)
-        if detail is None:
-            try:
-                boss_cli.limiter.wait()
-                detail = await asyncio.to_thread(boss_cli.job_detail, security_id)
-                store.job_detail_put(security_id, str(ctx.get("keyword") or ""), detail)
-            except boss_cli.BossError as exc:
-                task.error = f"岗位详情获取失败：{exc.detail}"
+        # ① 取单岗位 JD：链接通道走 detail 缓存；截图/文本通道用内联 JD
+        if security_id:
+            detail = store.job_detail_get(security_id)
+            if detail is None:
+                try:
+                    boss_cli.limiter.wait()
+                    detail = await asyncio.to_thread(boss_cli.job_detail, security_id)
+                    store.job_detail_put(security_id, str(ctx.get("keyword") or ""), detail)
+                except boss_cli.BossError as exc:
+                    task.error = f"岗位详情获取失败：{exc.detail}"
+                    return
+            if not isinstance(detail, dict):
+                task.error = "岗位详情解析失败，请稍后重试"
                 return
-        if not isinstance(detail, dict):
-            task.error = "岗位详情解析失败，请稍后重试"
+            jd = {
+                **_jd_digest(detail),
+                "brand": str(detail.get("brandName") or detail.get("brand") or detail.get("companyName") or ""),
+                "city": str(detail.get("cityName") or detail.get("city") or ""),
+            }
+        elif inline_jd is not None:
+            jd = {
+                "jobName": str(inline_jd.get("jobName") or "").strip(),
+                "salary": str(inline_jd.get("salary") or ""),
+                "experience": str(inline_jd.get("experience") or ""),
+                "skills": [str(s) for s in (inline_jd.get("skills") or [])][:8],
+                "desc": str(inline_jd.get("desc") or "")[:2000],
+                "brand": str(inline_jd.get("brand") or ""),
+                "city": str(inline_jd.get("city") or ""),
+            }
+            if not jd["jobName"] or len(jd["desc"]) < 20:
+                task.error = "内联 JD 数据不完整（岗位名或描述缺失），请重新解析"
+                return
+        else:
+            task.error = "缺少岗位数据（securityId 与内联 JD 均为空）"
             return
-        jd = {
-            **_jd_digest(detail),
-            "brand": str(detail.get("brandName") or detail.get("brand") or detail.get("companyName") or ""),
-            "city": str(detail.get("cityName") or detail.get("city") or ""),
-        }
         if ctx.get("jobName"):
             jd["jobName"] = str(ctx["jobName"])
 
@@ -937,7 +975,7 @@ async def run_generation_job_detail(
         concurrency = max(1, min(int((primary_cfg.get("params") or {}).get("concurrency", 3)), MAX_CONCURRENCY))
         semaphore = asyncio.Semaphore(concurrency)
         existing_stems = [q["stem"] for q in store.all_questions()]
-        resume_context = _resume_context(task.user_id)
+        resume_context = _resume_context(task.user_id) if use_resume else ""
 
         async def worker(dimension: str, count: int, dim_index: int) -> None:
             async with semaphore:
@@ -947,12 +985,12 @@ async def run_generation_job_detail(
                 try:
                     batch = await _generate_jd_batch(
                         dimension, count, jd, existing_stems, difficulty, with_answer,
-                        resume_context, task.user_id,
+                        resume_context, task.user_id, remedial_topics,
                     )
                 except llm.LlmError:
                     batch = await _generate_jd_batch(
                         dimension, count, jd, existing_stems, difficulty, with_answer,
-                        resume_context, task.user_id,
+                        resume_context, task.user_id, remedial_topics,
                     )
                 try:
                     verified = await _verify(batch)
@@ -990,12 +1028,129 @@ async def run_generation_job_detail(
                 "generate_done",
                 {"setId": set_id, "generated": task.generated},
             )
+            # 岗位匹配度报告（六期）：开关开启且有简历时随题集一并产出（失败不阻断）
+            saved_resume = store.user_resume(task.user_id) or {}
+            has_resume = bool(
+                str(saved_resume.get("text") or "").strip()
+                or str(saved_resume.get("summary") or "").strip()
+            )
+            if jd and use_resume and has_resume:
+                try:
+                    report = await generate_match_report(jd, task.user_id)
+                    store.add_jd_report(task.user_id, set_id=set_id, jd=jd, report=report)
+                except Exception:
+                    pass  # 报告为增值产物：失败不影响题集交付，详情页可稍后重算
 
 
 def start_job_detail(task: store.GenerateTask, set_id: str, ctx: dict[str, Any]) -> None:
     """启动单岗位专属出题后台任务（句柄挂在任务对象上防止被 GC）。"""
     task.set_id = set_id
     task.asyncio_handle = asyncio.create_task(run_generation_job_detail(task, set_id, ctx))
+
+
+# ================= 岗位匹配度报告（六期，文档 3.6 关键设计） =================
+# 口径隔离：本报告是「单岗位 JD × 简历」的深度评估，与引擎 B 的市场级 jobScores
+# （按关键词+城市批量算）不是同一产物，前端展示须区分来源。
+
+_MATCH_REPORT_SYSTEM = """你是资深技术招聘官，负责评估候选人与目标岗位的匹配度。
+把「目标岗位 JD」与「候选人简历」逐条对照，只输出一个 JSON 对象，不要解释性文字与 Markdown 围栏：
+{
+  "matchScore": 78,
+  "summary": "一句话总评，60 字内",
+  "strong": [
+    {"item": "JD 要求点", "evidence": "简历中的对应证据（项目/年限/技能）"}
+  ],
+  "weak": [
+    {"item": "JD 要求点", "evidence": "简历现状", "advice": "针对性补强建议，60 字内"}
+  ],
+  "gap": [
+    {"item": "JD 要求点", "advice": "应对策略：业务知识速成方向与面试诚实话术，80 字内"}
+  ]
+}
+字段口径：
+- matchScore：综合匹配度 0~100 整数；强匹配主导 75+，存在明显缺口 <60，中间按比例；
+- strong：强匹配项（简历有扎实证据直接对应 JD 要求）1~6 项；
+- weak：弱匹配项（沾边但深度不足，需补强突击）0~6 项；
+- gap：缺口项（简历完全缺失，需速成材料 + 诚实应对话术）0~6 项；
+硬性要求：
+- 覆盖 JD 的核心要求（技术栈/业务域/经验年限/软技能），不得遗漏最重要的要求；
+- 严格基于简历实际内容评估，不得臆造简历没有的经历；没有明确证据的要求归入 weak 或 gap；
+- 所有内容用中文（技术专有名词保留英文）。"""
+
+
+def _normalize_match_section(raw: Any, max_items: int = 6) -> list[dict[str, str]]:
+    """strong/weak/gap 列表归一化：item 必填，evidence/advice 可选截断。"""
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, str]] = []
+    for r in raw:
+        if not isinstance(r, dict):
+            continue
+        item = str(r.get("item") or "").strip()
+        if not item:
+            continue
+        entry = {"item": item[:60]}
+        evidence = str(r.get("evidence") or "").strip()
+        advice = str(r.get("advice") or "").strip()
+        if evidence:
+            entry["evidence"] = evidence[:160]
+        if advice:
+            entry["advice"] = advice[:160]
+        out.append(entry)
+        if len(out) >= max_items:
+            break
+    return out
+
+
+async def generate_match_report(jd: dict[str, Any], user_id: str) -> dict[str, Any]:
+    """岗位匹配度报告（JD×简历，primary 层）：匹配分 + 强/弱/缺口三分类。
+
+    供两路消费：出题任务完成后随题集落库（store.add_jd_report）、
+    POST /api/jd/match-report 即时预览（解析面板匹配度徽章）。
+    """
+    saved = store.user_resume(user_id) or {}
+    resume_text = str(saved.get("text") or "").strip()[:4000]
+    summary = str(saved.get("summary") or "").strip()
+    analysis = saved.get("analysis") or {}
+    if not resume_text and not summary:
+        raise llm.LlmError("当前用户没有简历数据，无法生成匹配度报告")
+
+    profile = ""
+    if analysis:
+        profile = (
+            f"\n\n候选人画像：目标岗位 {analysis.get('targetRole', '未知')}、"
+            f"折算年限 {analysis.get('years', 0)} 年、"
+            f"能力维度 {'、'.join(str(d.get('label')) for d in (analysis.get('dimensions') or [])[:6]) or '未知'}"
+        )
+    user_prompt = (
+        f"目标岗位 JD：\n{_jd_context_text(jd)}\n\n"
+        f"候选人简历原文：\n{resume_text or '（原文缺失，以画像摘要为准）'}"
+        + (f"\n\n候选人画像摘要：{summary}" if summary else "")
+        + profile
+    )
+    raw = await llm.chat_json(
+        "primary",
+        [
+            {"role": "system", "content": _MATCH_REPORT_SYSTEM},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.3,
+        max_tokens=4096,
+        thinking=False,
+    )
+    if not isinstance(raw, dict):
+        raise llm.LlmError("匹配度报告输出不是 JSON 对象")
+    try:
+        score = max(0, min(100, int(raw.get("matchScore"))))
+    except (TypeError, ValueError):
+        score = 0
+    return {
+        "matchScore": score,
+        "summary": str(raw.get("summary") or "").strip()[:120],
+        "strong": _normalize_match_section(raw.get("strong")),
+        "weak": _normalize_match_section(raw.get("weak")),
+        "gap": _normalize_match_section(raw.get("gap")),
+    }
 
 
 # ================= 引擎 D：语音模拟面试动态出题（五期，文档 3.9） =================

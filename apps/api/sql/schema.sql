@@ -310,6 +310,26 @@ CREATE TABLE IF NOT EXISTS job_pipeline (
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '求职看板（四列状态机）';
 
 -- ============================================================
+-- 引擎 C（六期）：岗位匹配度报告（jd_reports）。口径：单岗位 JD × 本人简历的深度评估
+-- （强/弱/缺口三分类 + 匹配分），与引擎 B 的市场级 jobScores 不是同一产物，不得混用。
+-- 出题任务（source=jd_target 且「结合我的简历生成」开启）完成后随题集落一行；
+-- 同一题集重生成时覆盖最新（读取按 user_id + set_id 取最近一份）。注销按 user 级联清理。
+-- ============================================================
+CREATE TABLE IF NOT EXISTS jd_reports (
+  report_id    VARCHAR(64)  NOT NULL COMMENT '报告 id（jdr-xxxxxxxx）',
+  user_id      VARCHAR(64)  NOT NULL COMMENT '所属用户（JWT sub）',
+  set_id       VARCHAR(64)  NOT NULL DEFAULT '' COMMENT '关联题集 id（空为独立预览，当前不落库）',
+  job_name     VARCHAR(128) NOT NULL DEFAULT '' COMMENT '岗位名',
+  brand        VARCHAR(128) NOT NULL DEFAULT '' COMMENT '公司',
+  match_score  INT          NOT NULL DEFAULT 0 COMMENT '综合匹配度 0~100',
+  report_json  JSON         NOT NULL COMMENT '报告正文（matchScore/summary/strong/weak/gap）',
+  created_at   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (report_id),
+  KEY idx_jd_reports_user (user_id),
+  KEY idx_jd_reports_set (set_id)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '岗位匹配度报告（引擎 C，六期）';
+
+-- ============================================================
 -- 语音模拟面试（五期 V2.11）：题目按「目标岗位 + 简历」实时动态生成，以 JSON 快照存于会话/作答行，
 -- 不入题库（命中率低、不做预合成缓存）；录音默认不留存，仅「逐场显式开启」才落盘，DB 只存相对路径引用。
 -- 故意不加外键——与进度/错题一致，允许短暂悬挂引用，删除会话时按 session_id 显式级联清理（见 db.delete_interview_session）。

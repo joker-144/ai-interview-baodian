@@ -97,9 +97,12 @@ def _split_text(text: str, budget: int = MAX_CHARS_PER_SEGMENT) -> list[str]:
 
 
 def _concat_wav(parts: list[bytes]) -> bytes:
-    """拼接多段 WAV（同一音色/模型，参数一致）；单段时原样返回。"""
-    if len(parts) == 1:
-        return parts[0]
+    """拼接多段 WAV（同一音色/模型，参数一致）；始终经 wave 模块重写头部。
+
+    DashScope 返回的 WAV 其 data-size 是 0x7FFFFFFF 占位值（伪时长 44739s），
+    直接回传前端会让 decodeAudioData / 时长展示依赖解析方容错；单段也重写为实际字节数，
+    多段拼接顺带修复。readframes 对占位头按实际数据返回（已实测），重写成本一次内存拷贝。
+    """
     out = io.BytesIO()
     with wave.open(out, "wb") as writer:
         header_set = False

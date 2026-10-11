@@ -43,6 +43,12 @@ class Settings:
     recordings_dir: str = os.getenv(
         "RECORDINGS_DIR", str(Path(__file__).resolve().parent.parent / "recordings")
     )
+    # 七期岗位追踪：Celery broker（Redis）；未部署 Redis 时仅定时链路不可用，API 不依赖
+    celery_broker_url: str = os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/0")
+    # 每日岗位追踪触发时刻（小时，24 小时制；Celery beat crontab 用，V2.12 确认每日 1 次）
+    tracking_hour: int = int(os.getenv("TRACKING_HOUR", "9"))
+    # 每日下架探测轮转批量（boss detail 受节流约束 ~3s/个，按 last_probe_at 升序轮转取批）
+    tracking_probe_batch: int = int(os.getenv("TRACKING_PROBE_BATCH", "10"))
 
 
 settings = Settings()

@@ -22,13 +22,14 @@ from app.routers import (
     reports,
     resumes,
     stats,
+    tracking,
     wrong_book,
 )
 
 app = FastAPI(
     title=settings.app_name,
-    version="0.5.0",
-    description="AI 面试练习平台 · 四期已交付 + 五期进行中（语音模拟面试：云端 TTS 读题 / 本地 SenseVoice 转写 / 动态出题 / STAR 评分 / 复盘）",
+    version="0.7.0",
+    description="AI 面试练习平台 · 六期已交付 + 七期 Agent 化（岗位追踪自主：订阅→定时检索→diff→匹配过滤→站内推送→下架探测；面试对话自主：STAR 评分驱动动态追问 ≤2 轮）",
 )
 
 app.add_middleware(
@@ -53,6 +54,7 @@ app.include_router(resumes.router)
 app.include_router(stats.router)
 app.include_router(jobs.router)
 app.include_router(jd.router)
+app.include_router(tracking.router)
 app.include_router(pipeline.router)
 app.include_router(interview.router)
 app.include_router(notifications.router)

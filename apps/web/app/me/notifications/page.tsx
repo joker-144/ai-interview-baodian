@@ -43,6 +43,25 @@ const TYPE_META: Record<
       `${p?.jobName ?? "岗位"} 面试定于 ${p?.interviewAt ?? "近期"}，建议先过一遍定向题库`,
     href: (p) => (p?.setId ? `/practice/${p.setId}` : "/pipeline"),
   },
+  job_match: {
+    label: "高分岗位匹配",
+    render: (p) =>
+      `${p?.jobName ?? "岗位"}${p?.salary ? ` · ${p.salary}` : ""} 匹配 ${p?.score ?? 0} 分${p?.reason ? `，${p.reason}` : ""}`,
+    href: () => "/jobs",
+  },
+  job_low_match: {
+    label: "低匹配新岗位",
+    render: (p) => {
+      const names = (p?.samples ?? []).slice(0, 3).join("、");
+      return `${p?.keyword ?? ""}${p?.city ? ` · ${p.city}` : ""} 新增 ${p?.count ?? 0} 个低匹配岗位${names ? `：${names}` : ""}`;
+    },
+    href: () => "/jobs",
+  },
+  job_delisted: {
+    label: "岗位下架提醒",
+    render: (p) => `${p?.jobName ?? "岗位"}${p?.brand ? `（${p.brand}）` : ""} 已下架，可去求职看板更新状态`,
+    href: () => "/pipeline",
+  },
 };
 
 export default function NotificationsPage() {

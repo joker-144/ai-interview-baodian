@@ -293,6 +293,60 @@ def _ensure_upgrade(conn: Any) -> None:
                 "  KEY idx_itv_turns_answer (answer_id, turn_no)"
                 ") ENGINE = InnoDB DEFAULT CHARSET = utf8mb4"
             )
+            # 七期（V2.12）：面试动态追问循环需要把「追问决策轨迹 / 追问回答评分」挂在轮次上
+            # （复盘报告的追问质量分析数据源），旧库补 meta_json 列，幂等容忍已存在
+            try:
+                cur.execute(
+                    "ALTER TABLE interview_turns ADD COLUMN meta_json JSON NULL "
+                    "COMMENT '轮次元数据（七期：面试官追问决策轨迹 / 候选人回答 STAR 评分）' AFTER transcript"
+                )
+            except Exception:
+                pass  # 列已存在
+            # 七期（V2.12）：岗位追踪订阅（keyword+city+阈值）——定时检索与 diff 推送的主体
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS job_subscriptions ("
+                "  id          VARCHAR(64)  NOT NULL COMMENT '订阅 id（sub-xxxxxxxx）',"
+                "  user_id     VARCHAR(64)  NOT NULL COMMENT '所属用户（JWT sub）',"
+                "  keyword     VARCHAR(64)  NOT NULL COMMENT '检索关键词',"
+                "  city        VARCHAR(32)  NOT NULL DEFAULT '' COMMENT '城市（可空=全国）',"
+                "  enabled     TINYINT(1)   NOT NULL DEFAULT 1 COMMENT '是否启用（停用则定时任务跳过）',"
+                "  min_score   INT          NOT NULL DEFAULT 75 COMMENT '高分推送阈值（0~100，用户可配）',"
+                "  created_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+                "  updated_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,"
+                "  PRIMARY KEY (id),"
+                "  KEY idx_subscriptions_user (user_id, enabled)"
+                ") ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '岗位追踪订阅（七期）'"
+            )
+            # 七期（V2.12）：订阅的追踪状态——已见岗位 diff 基线 + 上次运行摘要（轮询游标）
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS job_tracking_states ("
+                "  sub_id            VARCHAR(64) NOT NULL COMMENT '订阅 id',"
+                "  user_id           VARCHAR(64) NOT NULL COMMENT '所属用户（注销清理直删用）',"
+                "  seen_ids_json     JSON         NULL COMMENT '已见过的岗位 securityId 列表（diff 基线，封顶 300）',"
+                "  last_run_at       DATETIME     NULL COMMENT '上次追踪运行时刻',"
+                "  last_result_json  JSON         NULL COMMENT '上次运行摘要（新增/推送计数）',"
+                "  updated_at        DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,"
+                "  PRIMARY KEY (sub_id),"
+                "  KEY idx_tracking_user (user_id)"
+                ") ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '岗位追踪状态（七期）'"
+            )
+            # 七期（V2.12）：看板 zhipin 卡下架探测——miss 计数与轮转游标（last_probe_at 升序即轮转序）
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS job_offline_watch ("
+                "  card_id       VARCHAR(64)  NOT NULL COMMENT '看板卡 id（与 job_pipeline.id 同值）',"
+                "  user_id       VARCHAR(64)  NOT NULL COMMENT '所属用户',"
+                "  security_id   VARCHAR(512) NOT NULL COMMENT 'BOSS 岗位 security_id',"
+                "  job_name      VARCHAR(128) NOT NULL DEFAULT '' COMMENT '岗位名（通知文案用）',"
+                "  brand         VARCHAR(128) NOT NULL DEFAULT '' COMMENT '公司名（通知文案用）',"
+                "  miss_count    INT          NOT NULL DEFAULT 0 COMMENT '连续详情失效次数（>=2 判下架，防单次抖动误报）',"
+                "  delisted      TINYINT(1)   NOT NULL DEFAULT 0 COMMENT '是否已判定下架（判定后停止探测）',"
+                "  notified_at   DATETIME     NULL COMMENT '下架提醒已推送时刻（防重复打扰）',"
+                "  last_probe_at DATETIME     NULL COMMENT '最近一次探测时刻（轮转游标）',"
+                "  created_at    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+                "  PRIMARY KEY (card_id),"
+                "  KEY idx_offline_watch_user (user_id, delisted)"
+                ") ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '看板岗位下架探测（七期）'"
+            )
             # 题库归属隔离：旧库补 owner_id 列（空=公共题库/预置种子），幂等容忍已存在
             try:
                 cur.execute(
@@ -1220,6 +1274,10 @@ def clear_user_data(user_id: str) -> None:
                 "DELETE FROM daily_practices WHERE user_id = %s",
                 "DELETE FROM job_pipeline WHERE user_id = %s",
                 "DELETE FROM jd_reports WHERE user_id = %s",
+                # 七期：岗位追踪三表随注销一并清理（订阅 / diff 基线 / 下架探测行）
+                "DELETE FROM job_subscriptions WHERE user_id = %s",
+                "DELETE FROM job_tracking_states WHERE user_id = %s",
+                "DELETE FROM job_offline_watch WHERE user_id = %s",
                 "DELETE t FROM interview_turns t "
                 "JOIN interview_answers a ON a.id = t.answer_id "
                 "JOIN interview_sessions s ON s.id = a.session_id WHERE s.user_id = %s",
@@ -1912,17 +1970,24 @@ def load_interview_answers(session_id: str) -> list[dict[str, Any]]:
 
 
 def save_interview_turn(turn: dict[str, Any]) -> None:
-    """追问轮次写入（append-only；一轮一行，同 id 重写容错）。"""
+    """追问轮次写入（append-only；一轮一行，同 id 重写容错）。
+
+    七期：轮次可携带 meta（面试官追问的决策轨迹 / 候选人回答的 STAR 评分），
+    旧调用方不传 meta 时写 NULL，行为不变。
+    """
+    meta = turn.get("meta")
     try:
         conn = connection()
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO interview_turns (id, answer_id, turn_no, role, transcript) "
-                "VALUES (%s,%s,%s,%s,%s) "
-                "ON DUPLICATE KEY UPDATE role=VALUES(role), transcript=VALUES(transcript)",
+                "INSERT INTO interview_turns (id, answer_id, turn_no, role, transcript, meta_json) "
+                "VALUES (%s,%s,%s,%s,%s,%s) "
+                "ON DUPLICATE KEY UPDATE role=VALUES(role), transcript=VALUES(transcript), "
+                "meta_json=VALUES(meta_json)",
                 (
                     turn["id"], turn["answerId"], int(turn.get("turnNo", 1)),
                     turn.get("role", "interviewer"), turn.get("transcript", ""),
+                    json.dumps(meta, ensure_ascii=False) if meta is not None else None,
                 ),
             )
             conn.commit()
@@ -1931,12 +1996,12 @@ def save_interview_turn(turn: dict[str, Any]) -> None:
 
 
 def load_interview_turns(answer_id: str) -> list[dict[str, Any]]:
-    """某作答的全部追问轮次（按轮次升序）。"""
+    """某作答的全部追问轮次（按轮次升序；含七期 meta 元数据）。"""
     try:
         conn = connection()
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id, answer_id, turn_no, role, transcript, created_at "
+                "SELECT id, answer_id, turn_no, role, transcript, meta_json, created_at "
                 "FROM interview_turns WHERE answer_id = %s ORDER BY turn_no ASC, id ASC",
                 (answer_id,),
             )
@@ -1951,7 +2016,200 @@ def load_interview_turns(answer_id: str) -> list[dict[str, Any]]:
             "turnNo": int(r[2]),
             "role": r[3] or "interviewer",
             "transcript": r[4] or "",
-            "createdAt": r[5].strftime("%Y-%m-%d %H:%M:%S") if r[5] else "",
+            "meta": json.loads(r[5]) if r[5] else None,
+            "createdAt": r[6].strftime("%Y-%m-%d %H:%M:%S") if r[6] else "",
         }
         for r in rows
     ]
+
+
+# ================= 岗位追踪（七期，V2.12） =================
+# 订阅（job_subscriptions） / 追踪状态（job_tracking_states） / 下架探测（job_offline_watch）。
+# 内存镜像见 store.job_subscriptions / tracking_states / offline_watch；
+# API 进程与 Celery worker 是两个进程，经 MySQL 共享（定时链路因此要求 MySQL 可用）。
+
+def _subscription_row(row: tuple) -> dict[str, Any]:
+    """订阅行 -> camelCase dict（与内存镜像同构）。"""
+    return {
+        "id": row[0],
+        "userId": row[1],
+        "keyword": row[2] or "",
+        "city": row[3] or "",
+        "enabled": bool(row[4]),
+        "minScore": int(row[5]) if row[5] is not None else 75,
+        "createdAt": row[6].strftime("%Y-%m-%d %H:%M") if row[6] else "",
+        "updatedAt": row[7].strftime("%Y-%m-%d %H:%M") if row[7] else "",
+    }
+
+
+def save_subscription(sub: dict[str, Any]) -> None:
+    """订阅写入/覆盖（同 id 全量 upsert）。"""
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO job_subscriptions (id, user_id, keyword, city, enabled, min_score) "
+                "VALUES (%s,%s,%s,%s,%s,%s) "
+                "ON DUPLICATE KEY UPDATE keyword=VALUES(keyword), city=VALUES(city), "
+                "enabled=VALUES(enabled), min_score=VALUES(min_score)",
+                (
+                    sub["id"], sub["userId"], sub["keyword"], sub.get("city", ""),
+                    1 if sub.get("enabled", True) else 0, int(sub.get("minScore", 75)),
+                ),
+            )
+    except Exception as exc:
+        _warn(f"岗位订阅写库失败：{exc}")
+
+
+def load_subscriptions(user_id: str) -> list[dict[str, Any]] | None:
+    """某用户全部订阅；库不可用返回 None（调用方保持内存态）。"""
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, user_id, keyword, city, enabled, min_score, created_at, updated_at "
+                "FROM job_subscriptions WHERE user_id = %s ORDER BY created_at ASC",
+                (user_id,),
+            )
+            return [_subscription_row(r) for r in cur.fetchall()]
+    except Exception as exc:
+        _warn(f"岗位订阅读库失败：{exc}")
+        return None
+
+
+def load_all_subscriptions() -> list[dict[str, Any]] | None:
+    """全站全部订阅（Celery worker 侧逐用户跑追踪用）；库不可用返回 None。"""
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, user_id, keyword, city, enabled, min_score, created_at, updated_at "
+                "FROM job_subscriptions ORDER BY user_id ASC, created_at ASC"
+            )
+            return [_subscription_row(r) for r in cur.fetchall()]
+    except Exception as exc:
+        _warn(f"岗位订阅全量读库失败：{exc}")
+        return None
+
+
+def delete_subscription(sub_id: str) -> None:
+    """删除订阅（连带其追踪状态）。"""
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM job_subscriptions WHERE id = %s", (sub_id,))
+            cur.execute("DELETE FROM job_tracking_states WHERE sub_id = %s", (sub_id,))
+    except Exception as exc:
+        _warn(f"岗位订阅删库失败：{exc}")
+
+
+def save_tracking_state(state: dict[str, Any]) -> None:
+    """追踪状态写入/覆盖（seenIds diff 基线 + 上次运行摘要）。"""
+    seen = state.get("seenIds") or []
+    result = state.get("lastResult")
+    last_run = state.get("lastRunAt")
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO job_tracking_states (sub_id, user_id, seen_ids_json, last_run_at, last_result_json) "
+                "VALUES (%s,%s,%s,%s,%s) "
+                "ON DUPLICATE KEY UPDATE seen_ids_json=VALUES(seen_ids_json), "
+                "last_run_at=VALUES(last_run_at), last_result_json=VALUES(last_result_json)",
+                (
+                    state["subId"], state["userId"],
+                    json.dumps(seen, ensure_ascii=False),
+                    last_run or None,
+                    json.dumps(result, ensure_ascii=False) if result is not None else None,
+                ),
+            )
+    except Exception as exc:
+        _warn(f"岗位追踪状态写库失败：{exc}")
+
+
+def load_tracking_state(sub_id: str) -> dict[str, Any] | None:
+    """某订阅的追踪状态；无行/库不可用返回 None（调用方给空基线）。"""
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT seen_ids_json, last_run_at, last_result_json FROM job_tracking_states "
+                "WHERE sub_id = %s",
+                (sub_id,),
+            )
+            row = cur.fetchone()
+    except Exception as exc:
+        _warn(f"岗位追踪状态读库失败：{exc}")
+        return None
+    if row is None:
+        return None
+    return {
+        "seenIds": json.loads(row[0]) if row[0] else [],
+        "lastRunAt": row[1].strftime("%Y-%m-%d %H:%M") if row[1] else "",
+        "lastResult": json.loads(row[2]) if row[2] else None,
+    }
+
+
+def save_offline_watch(row_rec: dict[str, Any]) -> None:
+    """下架探测行写入/覆盖（card_id 全量 upsert）。"""
+    notified = row_rec.get("notifiedAt")
+    probed = row_rec.get("lastProbeAt")
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO job_offline_watch (card_id, user_id, security_id, job_name, brand, "
+                "miss_count, delisted, notified_at, last_probe_at) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                "ON DUPLICATE KEY UPDATE security_id=VALUES(security_id), job_name=VALUES(job_name), "
+                "brand=VALUES(brand), miss_count=VALUES(miss_count), delisted=VALUES(delisted), "
+                "notified_at=VALUES(notified_at), last_probe_at=VALUES(last_probe_at)",
+                (
+                    row_rec["cardId"], row_rec["userId"], row_rec["securityId"],
+                    row_rec.get("jobName", ""), row_rec.get("brand", ""),
+                    int(row_rec.get("missCount") or 0), 1 if row_rec.get("delisted") else 0,
+                    notified or None, probed or None,
+                ),
+            )
+    except Exception as exc:
+        _warn(f"岗位下架探测写库失败：{exc}")
+
+
+def load_offline_watch(user_id: str) -> list[dict[str, Any]] | None:
+    """某用户全部探测行（含已判定下架的）；库不可用返回 None。"""
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT card_id, user_id, security_id, job_name, brand, miss_count, delisted, "
+                "notified_at, last_probe_at FROM job_offline_watch WHERE user_id = %s",
+                (user_id,),
+            )
+            rows = cur.fetchall()
+    except Exception as exc:
+        _warn(f"岗位下架探测读库失败：{exc}")
+        return None
+    return [
+        {
+            "cardId": r[0],
+            "userId": r[1] or "",
+            "securityId": r[2] or "",
+            "jobName": r[3] or "",
+            "brand": r[4] or "",
+            "missCount": int(r[5] or 0),
+            "delisted": bool(r[6]),
+            "notifiedAt": r[7].strftime("%Y-%m-%d %H:%M") if r[7] else "",
+            "lastProbeAt": r[8].strftime("%Y-%m-%d %H:%M") if r[8] else "",
+        }
+        for r in rows
+    ]
+
+
+def delete_offline_watch(card_id: str) -> None:
+    """删除单条探测行（看板卡彻底删除时联动）。"""
+    try:
+        conn = connection()
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM job_offline_watch WHERE card_id = %s", (card_id,))
+    except Exception as exc:
+        _warn(f"岗位下架探测删库失败：{exc}")

@@ -89,7 +89,10 @@ export function InterviewRun({
   );
 
   const [answers, setAnswers] = useState<Record<number, InterviewAnswerResult>>(initialAnswers);
-  const [followups, setFollowups] = useState<Record<number, string>>({});
+  // 已答追问轮次（每轮 { ask 追问文本, answer 回答文本 }；七期动态追问最多 2 轮）
+  const [followups, setFollowups] = useState<Record<number, { ask: string; answer: string }[]>>({});
+  // 当前待回答的追问文本（undefined=尚未从后端拿到判定；null=无追问或已答完）
+  const [activeFollowUps, setActiveFollowUps] = useState<Record<number, string | null>>({});
   const [seq, setSeq] = useState(() => {
     const firstTodo = questions.findIndex((_, i) => !initialAnswers[i]);
     return firstTodo === -1 ? Math.max(0, questions.length - 1) : firstTodo;
@@ -125,7 +128,15 @@ export function InterviewRun({
   const question = questions[seq];
   const currentAnswer = answers[seq];
   const reanswering = reanswer || !currentAnswer;
-  const pendingFollowUp = Boolean(currentAnswer?.followUp) && followups[seq] === undefined;
+  const followupTurns = followups[seq] ?? [];
+  // 当前待回答的追问：优先用后端最新判定（activeFollowUps），未判定时回落第 1 轮追问
+  const activeAsk =
+    activeFollowUps[seq] !== undefined
+      ? activeFollowUps[seq]
+      : followupTurns.length === 0
+        ? currentAnswer?.followUp ?? null
+        : null;
+  const pendingFollowUp = Boolean(activeAsk);
   const target: "answer" | "followup" | null = reanswering ? "answer" : pendingFollowUp ? "followup" : null;
   const answeredCount = Object.keys(answers).length;
 
@@ -281,7 +292,9 @@ export function InterviewRun({
             ? { file: draftBlob, durationSec: draftDur, retainAudio: session.recordAudio }
             : { transcript: draftText.trim(), durationSec: draftDur, retainAudio: false };
         const r = await submitInterviewFollowup(session.id, currentAnswer.id, input);
-        setFollowups((m) => ({ ...m, [seq]: r.transcript }));
+        // 记录本轮问答；后端判定继续追问时保留下一轮文本（七期动态循环）
+        setFollowups((m) => ({ ...m, [seq]: [...(m[seq] ?? []), { ask: activeAsk ?? "", answer: r.transcript }] }));
+        setActiveFollowUps((m) => ({ ...m, [seq]: r.followUp ?? null }));
       }
       resetDraft();
       setDraftMode(voiceCapable ? "voice" : "text");
@@ -379,7 +392,7 @@ export function InterviewRun({
             <section className="card p-6">
               <div className="mb-4 flex items-center justify-between">
                 <h3 className="text-sm font-semibold">
-                  {target === "followup" ? "回答面试官追问" : "你的作答"}
+                  {target === "followup" ? `回答面试官追问${followupTurns.length ? ` · 第 ${followupTurns.length + 1} 轮` : ""}` : "你的作答"}
                 </h3>
                 {voiceCapable && (
                   <div className="flex items-center gap-1 rounded-btn bg-bg p-0.5 text-xs">
@@ -398,12 +411,12 @@ export function InterviewRun({
                 )}
               </div>
 
-              {target === "followup" && currentAnswer?.followUp && (
+              {target === "followup" && activeAsk && (
                 <div className="mb-4 rounded-btn border border-line bg-bg px-4 py-3 text-sm">
-                  <span className="mr-2 tag bg-purple-50 text-ai">追问</span>
-                  {currentAnswer.followUp}
+                  <span className="mr-2 tag bg-purple-50 text-ai">追问{followupTurns.length ? ` ${followupTurns.length + 1}` : ""}</span>
+                  {activeAsk}
                   {capabilities.ttsAvailable && (
-                    <button className="ml-2 text-xs text-brand hover:underline" onClick={() => onPlayTts(currentAnswer.followUp ?? undefined)}>
+                    <button className="ml-2 text-xs text-brand hover:underline" onClick={() => onPlayTts(activeAsk)}>
                       读追问
                     </button>
                   )}
@@ -479,14 +492,14 @@ export function InterviewRun({
               {currentAnswer?.comment && (
                 <p className="mt-3 text-sm text-muted">点评：{currentAnswer.comment}</p>
               )}
-              {followups[seq] !== undefined && (
-                <div className="mt-4 rounded-btn border border-line px-4 py-3">
-                  <p className="text-xs text-muted">追问 · 面试官</p>
-                  <p className="mt-1 text-sm">{currentAnswer?.followUp}</p>
-                  <p className="mt-2 text-xs text-muted">追问 · 你的回答</p>
-                  <p className="mt-1 whitespace-pre-wrap text-sm">{followups[seq] || "（未作答）"}</p>
+              {followupTurns.map((t, i) => (
+                <div key={i} className="mt-4 rounded-btn border border-line px-4 py-3">
+                  <p className="text-xs text-muted">追问 {i + 1} · 面试官</p>
+                  <p className="mt-1 text-sm">{t.ask}</p>
+                  <p className="mt-2 text-xs text-muted">追问 {i + 1} · 你的回答</p>
+                  <p className="mt-1 whitespace-pre-wrap text-sm">{t.answer || "（未作答）"}</p>
                 </div>
-              )}
+              ))}
               <div className="mt-4 flex items-center gap-3">
                 <button className="btn-secondary" onClick={() => setReanswer(true)}>重新作答</button>
                 <div className="flex-1" />

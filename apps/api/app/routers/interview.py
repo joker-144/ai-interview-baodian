@@ -1,5 +1,5 @@
 """语音模拟面试（五期，文档 3.9）：动态出题、TTS 读题、ASR 转写作答、
-light 层即时评分（STAR 四维 + 命中关键词）、一层追问、primary 层复盘报告、录音回放。
+light 层即时评分（STAR 四维 + 命中关键词）、动态追问（上限 2 轮）、primary 层复盘报告、录音回放。
 
 链路（对齐已批准方案）：
 - 出题：POST "" 按「目标岗位 + 简历」实时动态生成开放式题（generation.generate_interview_questions），
@@ -7,8 +7,10 @@ light 层即时评分（STAR 四维 + 命中关键词）、一层追问、primar
 - 读题：POST /{id}/tts 走云端 Qwen3-TTS（tts.asynthesize），同源回传可播放 WAV；
 - 作答：POST /{id}/answers 上传 wav → 本地 SenseVoice 离线转写（asr.atranscribe）→ light 层评分；
   无麦克风 / 弱网 / ASR 未就绪时前端降级为文字输入（只传 transcript，不传 file）；
-- 追问：回答有实质内容时回传题目预置的一层追问，候选人作答走 /{id}/answers/{aid}/followup；
-- 复盘：POST /{id}/finish 走 primary 层生成四维雷达 + 总评 + 改进建议，GET /{id}/report 读取。
+- 追问：七期升级为 STAR 评分驱动的动态追问循环（上限 2 轮）——按四维评分决策
+  「是否追问/追问方向」，LLM 失败回落题目预置追问；作答/追问轮次与决策轨迹入 meta；
+- 复盘：POST /{id}/finish 走 primary 层生成四维雷达 + 总评 + 改进建议（含追问质量分析），
+  GET /{id}/report 读取。
 
 合规口径（文档第五章第 6 条）：
 - 麦克风始终用于 ASR（语音面试前提），音频上传后端离线转写；
@@ -23,7 +25,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 
-from app import asr, generation, llm, store, tts
+from app import agent_runtime, asr, generation, llm, store, tts
 from app.auth import get_current_user
 from app.config import settings
 from app.schemas import InterviewSessionCreate, InterviewTtsRequest
@@ -145,7 +147,12 @@ def _report_payload(session: dict, answers: list[dict]) -> dict:
     for a in sorted(answers, key=lambda x: x.get("seq", 0)):
         item = _answer_payload(a)
         item["turns"] = [
-            {"turnNo": t.get("turnNo"), "role": t.get("role"), "transcript": t.get("transcript", "")}
+            {
+                "turnNo": t.get("turnNo"),
+                "role": t.get("role"),
+                "transcript": t.get("transcript", ""),
+                "meta": t.get("meta"),
+            }
             for t in store.interview_turns(a["id"])
         ]
         detailed.append(item)
@@ -246,6 +253,93 @@ async def _score_answer(question: dict, transcript: str) -> dict:
     return {"starScores": scores, "hitKeywords": hit, "missedKeywords": missed, "comment": comment}
 
 
+# ---------------- 动态追问循环（七期：STAR 评分驱动，上限 2 轮） ----------------
+
+FOLLOWUP_MAX_ROUNDS = 2  # 追问轮数硬上限：达到即强制停止，防止无限对话
+_FOLLOWUP_SYSTEM = """你是资深面试官。基于候选人上一轮回答与其 STAR 四维评分，判断是否需要追问以澄清薄弱环节。
+只输出 JSON 对象，不要解释性文字、不要 Markdown 围栏：
+{"ask": true, "followup": "追问问题，一句话 40 字以内，聚焦最薄弱的维度", "target": "situation/task/action/result 之一", "reason": "一句话决策依据，30 字以内"}
+评分口径：四维均衡且均 >= 7 分视为已充分，可不追问（ask=false）；追问必须针对最低分维度深挖，不要重复上一问。"""
+
+# LLM 失败时的维度兜底追问模板（第 2 轮起没有预置追问可用，按最弱维度取模板）
+_PRESET_FOLLOWUPS = {
+    "situation": "能补充一下当时的业务背景和你的具体角色吗？",
+    "task": "这个任务的目标和验收标准具体是什么？",
+    "action": "具体讲讲你个人负责的关键动作和技术细节？",
+    "result": "最终结果如何？有可量化的数据或复盘结论吗？",
+}
+
+
+def _star_average(star: dict) -> float:
+    """STAR 四维均分（0~10）。"""
+    vals = [_clamp_score((star or {}).get(k)) for k in SCORE_KEYS]
+    return sum(vals) / len(SCORE_KEYS)
+
+
+def _weakest_dimension(star: dict) -> str:
+    """最薄弱维度：分值升序；并列时优先 action（追问行动细节信息量最大）。"""
+    return min(SCORE_KEYS, key=lambda k: (_clamp_score((star or {}).get(k)), k != "action"))
+
+
+async def _decide_followup(question: dict, transcript: str, scored: dict, round_no: int) -> tuple[str, dict]:
+    """STAR 评分驱动的追问决策（七期 Agent 化）：light 层判定「是否追问/追问方向」。
+
+    返回 (追问文本, 决策 meta)；判定不追问时文本为空串。
+    LLM 失败静默降级：第 1 轮回落题目预置 followUp（保五期行为），
+    之后按最弱维度取兜底模板（避免重复同一预置问句）。
+    """
+    star = scored.get("starScores") or {}
+    weakest = _weakest_dimension(star)
+    preset = str(question.get("followUp") or "").strip()
+    meta: dict = {"round": round_no, "dynamic": False, "target": weakest, "presetUsed": False}
+
+    run = agent_runtime.AgentRun(f"followup:r{round_no}", ctx={"weakest": weakest})
+
+    async def _decide(r: agent_runtime.AgentRun) -> str:
+        scores = {k: _clamp_score(star.get(k)) for k in SCORE_KEYS}
+        user_prompt = (
+            f"面试题（{question.get('dimension', '技术')}）：{question.get('stem', '')}\n"
+            f"候选人回答：{transcript[:600]}\n"
+            f"STAR 四维评分（0~10）：{scores}\n\n"
+            f"这是第 {round_no} 轮追问的决策。请按要求输出 JSON。"
+        )
+        data = await llm.chat_json(
+            "light",
+            [
+                {"role": "system", "content": _FOLLOWUP_SYSTEM},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.4,
+            max_tokens=512,
+            thinking=False,
+        )
+        if not isinstance(data, dict):
+            raise llm.LlmError("追问决策未返回 JSON 对象")
+        r.ctx["decision"] = data
+        return str(data.get("followup") or "").strip()
+
+    record = await run.astep("llm-decide", _decide)
+    meta["steps"] = run.summary()["trajectory"]
+
+    decision = run.ctx.get("decision") if record is not None and record.ok else None
+    if isinstance(decision, dict):
+        meta["dynamic"] = True
+        meta["reason"] = str(decision.get("reason") or "").strip()[:80]
+        target = str(decision.get("target") or "").strip()
+        if target in SCORE_KEYS:
+            meta["target"] = target
+        if decision.get("ask"):
+            followup = str(decision.get("followup") or "").strip()[:120]
+            if followup:
+                return followup, meta
+        return "", meta  # 判定回答已充分（ask=false）→ 尊重决策，不追问
+
+    # LLM 失败 / 未产出有效决策 → 回落预置追问（静默降级，绝不 500）
+    meta["presetUsed"] = True
+    fallback = preset if round_no <= 1 and preset else _PRESET_FOLLOWUPS[weakest]
+    return fallback, meta
+
+
 # ---------------- primary 层复盘报告 ----------------
 
 _REPORT_SYSTEM = """你是资深面试官，请基于一场模拟面试的全部问答给出复盘总评。
@@ -257,6 +351,39 @@ _REPORT_SYSTEM = """你是资深面试官，请基于一场模拟面试的全部
   "improvements": ["改进建议，3~5 条，每条具体可操作，40 字内"]
 }
 所有内容用中文。"""
+
+
+def _followup_analysis(answers: list[dict]) -> dict:
+    """追问质量分析（七期）：各作答的追问轮数、动态决策占比、末轮评分提升。"""
+    items: list[dict] = []
+    total_rounds = 0
+    dynamic_rounds = 0
+    for a in sorted(answers, key=lambda x: x.get("seq", 0)):
+        turns = store.interview_turns(a["id"])
+        asked = [t for t in turns if t.get("role") == "interviewer"]
+        rounds = len(asked)
+        dynamic = sum(1 for t in asked if (t.get("meta") or {}).get("dynamic"))
+        base_avg = _star_average(a.get("starScores") or {})
+        candidates = [t for t in turns if t.get("role") == "candidate"]
+        last_star = (candidates[-1].get("meta") or {}).get("starScores") if candidates else None
+        last_avg = _star_average(last_star) if isinstance(last_star, dict) else base_avg
+        items.append({
+            "seq": a.get("seq", 0),
+            "rounds": rounds,
+            "dynamic": dynamic,
+            "baseAverage": round(base_avg, 1),
+            "lastAverage": round(last_avg, 1),
+            "improved": last_avg > base_avg,
+        })
+        total_rounds += rounds
+        dynamic_rounds += dynamic
+    return {
+        "answersWithFollowup": sum(1 for i in items if i["rounds"] > 0),
+        "totalRounds": total_rounds,
+        "dynamicRounds": dynamic_rounds,
+        "improved": sum(1 for i in items if i["improved"]),
+        "items": items,
+    }
 
 
 async def _build_report(session: dict, answers: list[dict]) -> dict:
@@ -321,6 +448,7 @@ async def _build_report(session: dict, answers: list[dict]) -> dict:
         "summary": summary,
         "strengths": _str_list(data.get("strengths"), 3, 60),
         "improvements": _str_list(data.get("improvements"), 5, 80),
+        "followup": _followup_analysis(answers),
     }
 
 
@@ -418,7 +546,7 @@ async def submit_answer(
     user_id: str = Depends(get_current_user),
 ) -> dict:
     """提交单题作答：上传 wav 走本地 ASR 转写（或直接传 transcript 文字降级）→
-    light 层 STAR 四维 + 命中关键词即时评分 → 判定是否触发一层追问；
+    light 层 STAR 四维 + 命中关键词即时评分 → STAR 评分决策是否触发动态追问（最多 2 轮）；
     仅「逐场显式开启」且本次 retainAudio 才落盘录音（默认不留存）。重新作答按 seq 覆盖。"""
     session = _require_session(user_id, session_id)
     if session.get("status") != "running":
@@ -467,14 +595,16 @@ async def submit_answer(
     }
     store.persist_interview_answer(answer)
 
-    # 一层追问判定：题目预置追问 + 回答有实质内容；追问以确定性 id 幂等落库
+    # 动态追问判定（七期）：回答有实质内容 → STAR 评分决策「是否追问/追问方向」，
+    # 追问以确定性 id 幂等落库，决策轨迹入轮次 meta
     follow_up = ""
-    if question.get("followUp") and len(text) >= FOLLOWUP_MIN_CHARS:
-        follow_up = question["followUp"]
-        store.persist_interview_turn({
-            "id": f"{answer_id}-t1", "answerId": answer_id, "turnNo": 1,
-            "role": "interviewer", "transcript": follow_up,
-        })
+    if len(text) >= FOLLOWUP_MIN_CHARS:
+        follow_up, follow_meta = await _decide_followup(question, text, scored, round_no=1)
+        if follow_up:
+            store.persist_interview_turn({
+                "id": f"{answer_id}-t1", "answerId": answer_id, "turnNo": 1,
+                "role": "interviewer", "transcript": follow_up, "meta": follow_meta,
+            })
 
     payload = _answer_payload(answer)
     payload["followUp"] = follow_up or None
@@ -491,7 +621,9 @@ async def submit_followup(
     retainAudio: bool = Form(True),
     user_id: str = Depends(get_current_user),
 ) -> dict:
-    """提交一层追问的作答：转写后存为候选人轮次（turnNo=2，确定性 id 幂等）。"""
+    """提交追问轮的作答：定位最近一个待回答的面试官追问，回答其下一轮
+    （turnNo 递增、确定性 id 幂等，重试覆盖同轮）；评分入轮次 meta。
+    未达追问上限且回答有实质内容时，决策是否继续追问下一轮。"""
     session = _require_session(user_id, session_id)
     if session.get("status") != "running":
         raise HTTPException(status_code=409, detail="面试已结束")
@@ -513,13 +645,48 @@ async def submit_followup(
     else:
         text = (transcript or "").strip()
 
+    # 定位最近一个待回答的面试官追问：回答其 turnNo+1（id 确定性，重试覆盖同轮）
+    turns = store.interview_turns(answer_id)
+    interviewer_turns = [t for t in turns if t.get("role") == "interviewer"]
+    if not interviewer_turns:
+        raise HTTPException(status_code=409, detail="该作答当前没有待回答的追问")
+    last = max(interviewer_turns, key=lambda t: t.get("turnNo", 0))
+    reply_turn_no = int(last.get("turnNo", 0)) + 1
+
+    # 候选人轮次带评分 meta（复盘报告据此计算追问带来的提升）
+    question = answer.get("question") or {}
+    scored = await _score_answer(question, text)
     store.persist_interview_turn({
-        "id": f"{answer_id}-t2", "answerId": answer_id, "turnNo": 2,
-        "role": "candidate", "transcript": text,
+        "id": f"{answer_id}-t{reply_turn_no}", "answerId": answer_id,
+        "turnNo": reply_turn_no, "role": "candidate", "transcript": text,
+        "meta": {"starScores": scored["starScores"], "comment": scored["comment"]},
     })
     if wav_bytes and session.get("recordAudio") and retainAudio:
-        _save_recording(session_id, f"{answer_id}-fu", wav_bytes)
-    return {"ok": True, "seq": answer.get("seq", 0), "transcript": text}
+        _save_recording(session_id, f"{answer_id}-fu{reply_turn_no}", wav_bytes)
+
+    # 未达追问上限 → STAR 决策是否继续追问下一轮（达到上限强制停止）
+    rounds_asked = len(interviewer_turns)
+    next_followup = ""
+    if rounds_asked < FOLLOWUP_MAX_ROUNDS and len(text) >= FOLLOWUP_MIN_CHARS:
+        next_followup, next_meta = await _decide_followup(
+            question, text, scored, round_no=rounds_asked + 1
+        )
+        if next_followup:
+            store.persist_interview_turn({
+                "id": f"{answer_id}-t{reply_turn_no + 1}", "answerId": answer_id,
+                "turnNo": reply_turn_no + 1, "role": "interviewer",
+                "transcript": next_followup, "meta": next_meta,
+            })
+            rounds_asked += 1
+
+    return {
+        "ok": True,
+        "seq": answer.get("seq", 0),
+        "transcript": text,
+        "starScores": scored["starScores"],
+        "followUp": next_followup or None,
+        "rounds": rounds_asked,
+    }
 
 
 @router.post("/{session_id}/finish")

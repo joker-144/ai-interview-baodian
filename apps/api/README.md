@@ -1,6 +1,6 @@
 # AI 面试宝典 · API（apps/api）
 
-FastAPI 后端，对齐产品文档 4.5 接口。C 端为**真实链路**：分层 LLM 真实调用（简历解析 / 出题 / 体检评分 / AI 优化 / 学习计划与周报 / 五期语音面试 STAR 评分与复盘，均带降级路径）；**语音：本地 SenseVoice ASR 离线转写 + 云端 Qwen3-TTS-Flash 实时合成**（五期）；数据**内存优先 + MySQL 尽力持久化**（`config/db.json`，连接失败自动降级回内存）；**管理端模型配置落盘**（`config/llm.json`，含混淆 Key，重启不丢）。
+FastAPI 后端，对齐产品文档 4.5 接口。C 端为**真实链路**：分层 LLM 真实调用（简历解析 / 出题 / 体检评分 / AI 优化 / 学习计划与周报 / 五期语音面试 STAR 评分与复盘，均带降级路径）；**语音：本地 SenseVoice ASR 离线转写 + 云端 Qwen3-TTS-Flash 实时合成**（五期）；数据**内存优先 + MySQL 尽力持久化**（`config/db.json`，连接失败自动降级回内存）；**管理端模型配置落盘**（`config/llm.json`，含混淆 Key，重启不丢）；**七期 Agent 化**：岗位追踪自主（订阅 CRUD + Celery beat 每日定时 + `POST /api/tracking/run` 立即运行同一管线，环境不可用整轮静默中止零通知）+ 面试对话动态追问（STAR 四维评分驱动、上限 2 轮）+ 自研轻量编排 `agent_runtime.py`（AgentRun 轨迹 + ToolRegistry，**非 LangGraph**）。
 
 ## 启动
 
@@ -12,6 +12,14 @@ python -m uvicorn app.main:app --reload --port 8000
 
 - 接口文档（Swagger）：http://localhost:8000/docs
 - 前端联调：`apps/web/lib/api.ts` 已全部直连 `http://127.0.0.1:8000`（管理端与 C 端均为真实 API，非 Mock）
+- **七期岗位追踪定时链路（可选，需 Redis）**：另开两个终端，在本目录下分别执行（Windows 下 worker 用 `--pool=solo`）：
+
+```powershell
+python -m celery -A app.celery_app.celery_app worker --pool=solo -l info
+python -m celery -A app.celery_app.celery_app beat -l info
+```
+
+beat 每日 `TRACKING_HOUR`（默认 9 点）触发 worker 跑 `app/tasks.py`（订阅检索 → diff → 匹配分过滤 → 推送 → 下架探测）；不启动时其余功能不受影响，`POST /api/tracking/run` 可手动跑同一管线。worker 与 API 经 **MySQL 共享**订阅数据（纯内存模式下定时链路自然空转）。
 
 ## 结构
 
@@ -36,6 +44,10 @@ apps/api/
     ├── local_models.py # 本地模型离线推理（懒加载单例 + 真实自测）
     ├── asr.py         # 【五期】本地 ASR（SenseVoice-Small int8 / sherpa-onnx）离线整段转写，懒加载进程内单例
     ├── tts.py         # 【五期】云端 TTS（Qwen3-TTS-Flash / DashScope 裸 HTTP）题目实时合成，512 Token 上限保护 + 降级错误
+    ├── agent_runtime.py # 【七期】自研轻量 Agent 编排单模块：AgentRun（step/astep 步骤轨迹 + abort 中止 + summary 汇总）+ ToolRegistry（工具注册）；岗位追踪与动态追问复用同一运行时（未采用 LangGraph）
+    ├── tracking.py    # 【七期】岗位追踪管线：只读检索 → diff seenIds → 两阶段匹配分 → 站内通知（高分逐条/低分汇总）→ 看板 zhipin 卡下架探测；_ABORT_ERRORS（未装 CLI/未登录/风控/专用浏览器未就绪）整轮静默中止零通知
+    ├── celery_app.py  # 【七期】Celery 实例 + beat 每日 crontab（TRACKING_HOUR 默认 9 点触发岗位追踪）
+    ├── tasks.py       # 【七期】每日岗位追踪任务：遍历全部启用订阅用户，逐用户跑 tracking.run_user_tracking
     ├── llm_config_file.py # 模型配置 / 历史快照 / 审计的落盘读写边界（原子写）
     └── routers/
         ├── auth.py         # 注册 / 登录（密码 + 手机验证码 + 微信，JWT）/ 我的信息
@@ -51,9 +63,10 @@ apps/api/
         ├── stats.py        # 本周统计（近 7 天作答柱状 + 三卡，answer_events 聚合）
         ├── reports.py      # 学习周报（趋势 / 薄弱知识点 TOP5 / AI 下周建议，按周缓存）
         ├── exams.py        # 模拟考试：组卷 / 答题增量落库 / 暂停恢复 / 交卷判分 / 模考报告 / 补强练习
-        ├── notifications.py # 站内通知（出题完成 / 模考报告 / 复习到期 / 面试临近）
+        ├── notifications.py # 站内通知（出题完成 / 模考报告 / 复习到期 / 面试临近 /【七期】岗位追踪三类推送）
         ├── me.py           # 我的 / 设置（P14）：资料 + 统计 + 注销冷静期 + 数据导出
-        ├── interview.py    # 【五期】语音模拟面试：创建/进度/capabilities/tts/作答/追问/finish/report/audio/删除（按 user_id 隔离）
+        ├── interview.py    # 【五期/七期】语音模拟面试：创建/进度/capabilities/tts/作答/动态追问/finish/report/audio/删除（按 user_id 隔离；【七期】STAR 评分驱动动态追问 ≤2 轮 + 决策轨迹入 turns.meta + 报告追问质量分析）
+        ├── tracking.py     # 【七期】岗位追踪订阅管理：GET|POST|PUT|DELETE /api/tracking/subscriptions（上限 5 个、同关键词+城市 409）+ POST /api/tracking/run 手动触发
         └── admin.py        # 【管理端】分层模型配置 / 连通性自测 / 回滚 / 审计（文档 4.6.1）
 ```
 
@@ -70,6 +83,9 @@ apps/api/
 | `ASR_THREADS` | `4` | 【五期】本地 ASR（SenseVoice）推理线程数；4 线程实测约 22 倍实时 |
 | `ASR_MODEL_ID` | `sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17` | 【五期】本地 ASR 模型 id（`apps/api/models/<id>/`） |
 | `RECORDINGS_DIR` | `apps/api/recordings` | 【五期】面试录音留存目录（仅逐场显式开启才落盘，已 gitignored；DB 只存相对路径） |
+| `CELERY_BROKER_URL` | `redis://localhost:6379/0` | 【七期】Celery broker（Redis）；未部署时仅岗位追踪定时链路不可用，API 不依赖 |
+| `TRACKING_HOUR` | `9` | 【七期】每日岗位追踪触发时刻（24 小时制，Celery beat crontab） |
+| `TRACKING_PROBE_BATCH` | `10` | 【七期】每日下架探测轮转批量（boss detail 受节流约束 ~3s/个，按 last_probe_at 升序取最久未探测优先） |
 
 > MySQL 连接不走环境变量，见 `config/db.json`（模板 `db.json.example`）：`enabled=false`、密码错误或库不存在时打印告警并**自动降级内存模式**，其余功能不受影响。
 
@@ -146,7 +162,7 @@ python scripts/download_models.py --model sherpa-onnx-sense-voice-zh-en-ja-ko-yu
 | POST | /api/exams/{exam_id}/remedial | 按薄弱知识点标签抽同标签题生成补强练习卷（不调 LLM） |
 | GET | /api/notifications | 站内信倒序列表 + 未读数；顺带惰性补写当日复习到期汇总（当日去重） |
 | PUT | /api/notifications/{notification_id}/read | 单条已读 |
-| PUT | /api/notifications/read-all | 全部已读；触发源：出题完成 / 模考报告 / 复习到期汇总 / 面试临近提醒 |
+| PUT | /api/notifications/read-all | 全部已读；触发源：出题完成 / 模考报告 / 复习到期汇总 / 面试临近提醒 /【七期】岗位追踪（job_match 高分匹配 / job_low_match 低分汇总 / job_delisted 下架提醒） |
 | GET | /api/me | 我的页一次拉齐：资料 + 三统计卡 + 我的数据计数 + 偏好 + 注销态 |
 | PUT | /api/me | 更新资料（姓名 / 头像字 / 目标岗位 / 年限；改姓名未指定头像字则自动取首字） |
 | PUT | /api/me/settings | 更新偏好（复习提醒开关与时间，`HH:mm` 校验） |
@@ -177,12 +193,15 @@ python scripts/download_models.py --model sherpa-onnx-sense-voice-zh-en-ja-ko-yu
 | GET | /api/interview-sessions/capabilities | 【五期】语音能力探测 `{asrAvailable, ttsAvailable}`（前端据此降级） |
 | GET | /api/interview-sessions/{id} | 【五期】会话进度与当前题 |
 | POST | /api/interview-sessions/{id}/tts | 【五期】题目文字→音频（云端 Qwen3-TTS-Flash），同源回传可播放音频；无 Key 报可读 502 |
-| POST | /api/interview-sessions/{id}/answers | 【五期】上传 wav + `retainAudio` → 本地 ASR 转写 → light 层 STAR 四维 + 命中关键词（3s 内）→ 判定是否触发追问；`retainAudio=true` 才落盘 |
-| POST | /api/interview-sessions/{id}/answers/{aid}/followup | 【五期】提交追问作答（同上转写/评分，轮次挂 `interview_turns`） |
-| POST | /api/interview-sessions/{id}/finish | 【五期】primary 层生成复盘报告（四维雷达 + 每题文字稿 + 改进建议），回写 `report_json` |
+| POST | /api/interview-sessions/{id}/answers | 【五期/七期】上传 wav + `retainAudio` → 本地 ASR 转写 → light 层 STAR 四维 + 命中关键词（3s 内）→【七期】四维评分驱动决策是否动态追问（决策与理由入轮次 meta）；`retainAudio=true` 才落盘；返回体含 `starScores/followUp` |
+| POST | /api/interview-sessions/{id}/answers/{aid}/followup | 【五期/七期】提交追问作答（同上转写/评分，轮次挂 `interview_turns`，确定性 id 幂等、重试覆盖同轮）；【七期】未达上限时决策是否继续追问下一轮（`FOLLOWUP_MAX_ROUNDS=2` 硬上限），返回 `{rounds, followUp, starScores}` |
+| POST | /api/interview-sessions/{id}/finish | 【五期/七期】primary 层生成复盘报告（四维雷达 + 每题文字稿 + 改进建议 +【七期】追问质量分析 `followup`：answersWithFollowup / totalRounds / dynamicRounds / improved / 逐题明细），回写 `report_json` |
 | GET | /api/interview-sessions/{id}/report | 【五期】读复盘报告（仅本人） |
 | GET | /api/interview-sessions/{id}/answers/{aid}/audio | 【五期】录音回放（仅本人、仅开启留存时；FileResponse） |
 | DELETE | /api/interview-sessions/{id} | 【五期】删除会话（级联清理作答/追问与落盘录音） |
+| GET / POST | /api/tracking/subscriptions | 【七期】我的订阅列表（含上次运行时刻与摘要）/ 新增订阅（body `{keyword, city, minScore}`，minScore 默认 75；同关键词+城市重复 409、每用户上限 5 个 409） |
+| PUT / DELETE | /api/tracking/subscriptions/{sub_id} | 【七期】更新订阅（启停 / 改阈值）/ 删除订阅（连带追踪基线） |
+| POST | /api/tracking/run | 【七期】手动触发当前用户一轮岗位追踪（Celery beat 同款管线：订阅检索 → diff → 两阶段匹配分 → 推送 → 下架探测）；同步返回 AgentRun 轨迹汇总（steps/failed/trajectory/aborted）；Boss 环境不可用（未装 CLI / 未登录 / 风控 / 专用浏览器未就绪）整轮静默中止、不产生通知 |
 | GET | /api/health | 健康检查 |
 
 ### 管理端（需请求头 `X-Admin-Token`）
@@ -239,7 +258,7 @@ python scripts/download_models.py --model sherpa-onnx-sense-voice-zh-en-ja-ko-yu
 > 原挂在四期、V2.10 顺延至五期的「引擎 C 完整三通道（粘贴 BOSS 链接 / 上传岗位截图 / 粘贴 JD 文本）+ 岗位匹配度报告（JD×简历 匹配分 + 强/弱匹配 + 缺口→补强突击题包）+ 『结合我的简历生成』开关 + 掌握度图谱」，
 > **V2.11 再行拆期**：五期实际仅交付「语音模拟面试」（本地 ASR + 云端 TTS + 动态出题 + STAR 评分 + 复盘 + 合规录音），上述引擎 C 完整通道与匹配度报告**拆至六期**；六期已交付（`/api/jd/parse` 三通道 + `/api/jd/match-report` 报告 + generate inputChannel/useResume/remedialTopics/cardId 扩展 + 前端 `/jd` 页与看板手动卡「JD 定制出题」入口，新表 `jd_reports`）；掌握度图谱入 6.6 远期；拆段理由与处置建议见文档 6.2 / 6.5 第 7 条。
 
-## 分期落地状态（对齐产品文档第六章 V2.11）
+## 分期落地状态（对齐产品文档第六章 V2.13）
 
 | 期次 | 后端交付内容 | 状态 |
 |---|---|---|
@@ -249,6 +268,7 @@ python scripts/download_models.py --model sherpa-onnx-sense-voice-zh-en-ja-ko-yu
 | 四期 W11~W13 | 引擎 B **两阶段匹配评分漏斗**（Stage1 词法预筛 top-K 无 LLM → 仅对 K 抓 JD 详情 → Stage2 LLM 产出 0~100 匹配分 + 理由，失败降级词法分不阻断；匹配分并入考点地图 `jobScores` 并回填看板卡）、求职看板 `/api/pipeline*`（四列状态机 / 回收站 / 趋势统计 / 面试临近提醒）、**引擎 C 子集** `generate source=jd_target`（单岗位专属预测题，看板一键生成 + 发起即挂接卡 setId）、检索卡「岗位要求」可折叠区、检索缓存 TTL 收紧为 1 天 | ✅ 已交付（引擎 C 仅子集） |
 | 五期 W14~W15 | Web 语音模拟面试：**本地 ASR**（`asr.py` SenseVoice-Small int8 / sherpa-onnx 离线整段转写）、**云端 TTS**（`tts.py` Qwen3-TTS-Flash / DashScope 裸 HTTP）、**动态出题**（`generation.generate_interview_questions` 按简历+岗位实时生成、不落题库）、面试路由（`/api/interview-sessions*`：创建/进度/capabilities/tts/作答/追问/finish/report/audio/删除）、STAR 四维实时评估 + 命中关键词 + 一层追问 + 四维雷达复盘、录音逐场显式开启/回放/级联清理、无麦克风/弱网/ASR 未下载降级文字 | ✅ 已交付 |
 | 六期 W15~W16 | **引擎 C 完整三通道**（`/api/jd/parse`：粘贴链接解析 security_id / 上传截图 vision 多模态提取 + boss search 反查锁定（失败降级视觉结果）/ 粘贴文本 LLM 结构化兜底，统一产出结构化 JD；generate settings 增 `inputChannel` 分派 + 内联 JD + `cardId` 显式挂接看板手动卡）、**岗位匹配度报告**（`/api/jd/match-report`：JD×简历 匹配分 0~100 + 强/弱匹配/能力缺口三分类；即时预览不落库 + 出题联动落 `jd_reports` 可回看；弱项/缺口勾选 → `remedialTopics` 补强突击题包）、**「结合我的简历生成」开关**（`useResume` 默认开，出题注入简历上下文 + 联动产出完整报告）、前端 `/jd` 页（三 tab + 解析面板 + 匹配度徽章 + 报告三分类 + 补强题包 + SSE 进度）与看板手动卡「JD 定制出题」入口 | ✅ 已交付（掌握度图谱入产品文档 6.6 远期） |
+| 七期 | **Agent 化改造**：① **岗位追踪自主**——`tracking.py` 管线（boss 只读检索→diff seenIds→两阶段匹配分→站内通知→看板下架探测）+ `routers/tracking.py` 订阅 CRUD 与手动触发 + `celery_app.py`/`tasks.py` 每日定时（beat）；推送 job_match（≥ 阈值逐条、单订阅单日上限 5 条）/ job_low_match（汇总一条）/ job_delisted（连续 2 次 detail miss 判定）；_ABORT_ERRORS 环境类错误整轮静默中止零通知。② **面试对话自主**——`interview.py` STAR 四维评分驱动动态追问（light 层决策 ask/方向/理由，上限 2 轮强制停止；LLM 失败第 1 轮回落题目预置、之后按最弱维度模板；轮次确定性 id 幂等 + 决策轨迹入 `turns.meta`；报告追加追问质量分析）。③ **自研轻量编排**——`agent_runtime.py`（AgentRun 步骤轨迹/中止/汇总 + ToolRegistry 只读工具注册，非 LangGraph）。新表 `job_subscriptions` / `job_tracking_states` / `job_offline_watch`，`interview_turns` 加 `meta_json` 列（均入 `schema.sql` + `_ensure_upgrade` 幂等补建；`clear_user_data` 级联清理） | ✅ 已交付 |
 | App A1~A3 W16~W22 | 小程序 / 移动端（复用本 API，不新增后端能力） | ⬜ 未开始 |
 
 > **口径不得混用**：`/api/jobs/map` 返回的 `jobScores`（`{securityId: {score, reason}}`）是**引擎 B 的市场级**匹配分——按「关键词 + 城市」批量评分、用于岗位卡「匹配 N%」与看板回填；
@@ -259,8 +279,11 @@ python scripts/download_models.py --model sherpa-onnx-sense-voice-zh-en-ja-ko-yu
 > 新表 `jd_reports`（report_id PK / idx_user / idx_set，同 setId 覆盖式插入，注销级联清理），已同步 `sql/schema.sql`；
 > 复用了 `source=jd_target` 出题骨架（六维规划 + 复判 + 去重 + 落库 + SSE）、题集按岗位名归并、看板卡 setId 挂接、`job_details` 7 天缓存、notifications 站内信。
 > 注：`app/models.py` 里的 `follow_up_json` / `resume_anchor` / `jd_anchor` 等列属 SQLAlchemy **预留定义**（该文件未参与实际建表，真实 DDL 在 `sql/schema.sql`），不可当作已落地能力引用。
+>
+> **七期交付口径（实测）**：订阅 CRUD（重复 409 / 上限 5 个 409）+ `POST /api/tracking/run` 降级路径（Boss 专用浏览器未连接 → preflight 后整轮静默中止，200 返回完整轨迹、aborted 非空、**零通知**）+ 动态追问链路（真实 LLM 决策 dynamicRounds=2、rounds 硬上限 2、followup 重试幂等同轮覆盖、interviewer 轮次 meta 含 round/dynamic/presetUsed、candidate 轮次带 starScores meta）+ finish 报告含 followup 分析键——均端到端联调验证通过（验证脚本按「测试通过即删」约定移除）。
+> 定时链路依赖：Redis（broker）+ MySQL（worker 与 API 跨进程共享订阅/通知）+ Boss 环境（与三期引擎 B 同一套：CLI + 登录态 + 专用 CDP Chrome，见下节）；任一缺失时**仅定时链路受影响**，手动触发与其余功能不受影响。
 
-## 岗位检索环境准备（三期，引擎 B）
+## 岗位检索环境准备（三期引擎 B；七期岗位追踪复用同一套）
 
 ```powershell
 # ① 安装 CLI（PyPI 镜像超时可加 --index-url https://pypi.org/simple）

@@ -28,19 +28,21 @@
 - **模拟考试**：限时组卷、断网恢复（答题增量落库）、模考报告含同岗位分桶百分位与一键补强练习
 - **简历体检报告**：总分 + 亮点/待改进清单、AI 一键优化简历（多版本对比 + DOCX 下载）
 - 站内通知中心、全量数据导出（单 JSON 下载）
-- **语音模拟面试**（五期已交付）：**本地 SenseVoice 离线 ASR**（录完即传、秒级转写、音频不出网）+ **云端 Qwen3-TTS-Flash 实时合成面试官声音**；题目按简历+岗位动态生成（不落题库），STAR 四维实时评估 + 命中关键词检测 + AI 面试官一层追问 + 四维雷达复盘；录音逐场显式开启（默认不留存、可回放可删）；无麦克风/弱网/ASR 未下载自动降级文字输入
+- **语音模拟面试**（五期已交付）：**本地 SenseVoice 离线 ASR**（录完即传、秒级转写、音频不出网）+ **云端 Qwen3-TTS-Flash 实时合成面试官声音**；题目按简历+岗位动态生成（不落题库），STAR 四维实时评估 + 命中关键词检测 + 四维雷达复盘；**AI 面试官动态追问（七期升级）**：按 STAR 四维评分实时决策「是否追问/追问方向」，上限 2 轮、LLM 失败回落预置追问，复盘报告追加追问质量分析；录音逐场显式开启（默认不留存、可回放可删）；无麦克风/弱网/ASR 未下载自动降级文字输入
 - **求职看板**：已投递 → 笔试 → 面试 → Offer 四列状态机 + 回收站 + 趋势统计；岗位检索「加入看板」自动带入匹配分并挂接定向题库（显示练习进度、去练习直达），zhipin 卡一键生成该岗位**专属预测题**（题量/难度/附答案设置 + SSE 卡级进度，生成后自动挂接），面试日期临近联动复习提醒；纯本地状态机，不代投递 / 不打招呼 / 不监听 HR
+- **岗位追踪订阅**（七期已交付）：订阅「关键词 + 城市 + 匹配阈值」→ Celery beat **每日 1 次**（默认 9 点，可 `TRACKING_HOUR` 配置）只读检索 → diff 新岗位 → 两阶段匹配分过滤 → 推送「高分匹配」（≥ 阈值逐条、单订阅单日上限 5 条）与「低匹配新岗位」（汇总一条，不逐条打扰）；看板 zhipin 卡按日轮转探测**下架提醒**（连续 2 次详情失效才判定，防单次抖动误报）；Boss 环境不可用（未登录 / 风控 / 专用浏览器未就绪）整轮**静默中止、零通知零打扰**；支持页面「立即运行一次」（`POST /api/tracking/run`，与定时跑同一管线）；运行全轨迹（AgentRun 步骤/耗时/中止原因）随接口返回，可观测
 
 ## 技术架构
 
 ```
 Next.js (Web) + Taro (小程序)          ← 双端同构，同一套 API
         │ HTTPS / SSE（出题进度流式）
-FastAPI + Celery + Redis              ← 异步任务 + 流式出题进度
+FastAPI + Celery + Redis              ← 异步任务 + 流式出题进度；Celery beat 每日定时跑岗位追踪（七期）
         │
-LangGraph 出题状态机                   ← Planner → Generator×N → Critic → Verifier → Dedup
-        │                                （Checkpoint 持久化 · 崩溃续跑 · 结构化输出）
-MySQL（已落地）                          ← 题库 + 用户数据（进度/错题/简历多版本/模考/计划/通知/求职看板/语音面试）持久化；连接失败自动降级内存
+自研异步出题管线（generation.py）        ← Plan → Generate×N → Verify → Dedup（结构化输出 + 复判 + 语义去重）
+自研轻量 Agent 编排（agent_runtime.py） ← 七期：AgentRun 步骤轨迹/中止/汇总 + ToolRegistry 只读工具注册
+        │                                （岗位追踪管线与面试动态追问复用同一运行时；未采用 LangGraph）
+MySQL（已落地）                          ← 题库 + 用户数据（进度/错题/简历多版本/模考/计划/通知/求职看板/语音面试/岗位订阅追踪）持久化；连接失败自动降级内存
         │
 本地模型 (apps/api/models)          ← Embedding + SenseVoice ASR 离线推理 · 不出网不计费
         │
@@ -78,6 +80,7 @@ ai-interview-baodian/
 | Python | 3.11+（实测 3.13.5） | 必需 | FastAPI 后端 |
 | Node.js | 18+（实测 v24.14.0） | 必需 | Next.js 14 前端 |
 | MySQL | 8.0（用到了 JSON 类型） | 可选 | 题库持久化；**不装也能跑但重启丢数据** |
+| Redis | 7.x | 可选 | 七期岗位追踪定时调度（Celery broker + beat）；**不装时仅每日定时链路不可用**，页面「立即运行一次」与其余功能不受影响 |
 | 云端大模型 API Key | DeepSeek / OpenAI / 通义等 | 必需 | 简历解析与出题（在管理端配置） |
 | [uv](https://docs.astral.sh/uv/) + boss-agent-cli | 最新 | 可选 | 引擎 B 岗位检索（`uv tool install boss-agent-cli`；需本机 `boss login` 扫码登录，仅只读检索） |
 
@@ -119,7 +122,7 @@ python scripts\download_models.py --model sherpa-onnx-sense-voice-zh-en-ja-ko-yu
 mysql -u root -p --default-character-set=utf8mb4 -e "source apps/api/sql/schema.sql"
 ```
 
-脚本会创建 `ai_interview_baodian` 库，共 20 张表：题库 2 张（`question_sets` / `questions`）+ 出题任务 1 张（`generate_tasks`）+ 用户数据 9 张（`users` / `practice_progress` / `answer_events` / `wrong_items` / `favorites` / `resumes` / `study_plans` / `exam_records` / `notifications`）+ 三期 4 张（`jobs_cache` / `job_details` / `job_maps` / `daily_practices`）+ 四期 1 张（`job_pipeline` 求职看板四列状态机）+ 五期 3 张（`interview_sessions` / `interview_answers` / `interview_turns` 语音面试）。全部语句为 `CREATE IF NOT EXISTS` + 容错 `ALTER`，**可重复执行**；老库直接启动时后端也会自动补建新表（`_ensure_upgrade`），无需手动迁移。随后复制连接配置模板并填入你的密码：
+脚本会创建 `ai_interview_baodian` 库，共 24 张表：题库 2 张（`question_sets` / `questions`）+ 出题任务 1 张（`generate_tasks`）+ 用户数据 9 张（`users` / `practice_progress` / `answer_events` / `wrong_items` / `favorites` / `resumes` / `study_plans` / `exam_records` / `notifications`）+ 三期 4 张（`jobs_cache` / `job_details` / `job_maps` / `daily_practices`）+ 四期 1 张（`job_pipeline` 求职看板四列状态机）+ 五期 3 张（`interview_sessions` / `interview_answers` / `interview_turns` 语音面试）+ 六期 1 张（`jd_reports` 匹配度报告）+ 七期 3 张（`job_subscriptions` / `job_tracking_states` / `job_offline_watch` 岗位追踪订阅）。全部语句为 `CREATE IF NOT EXISTS` + 容错 `ALTER`，**可重复执行**；老库直接启动时后端也会自动补建新表（`_ensure_upgrade`），无需手动迁移。随后复制连接配置模板并填入你的密码：
 
 ```powershell
 copy apps\api\config\db.json.example apps\api\config\db.json
@@ -152,6 +155,15 @@ python -m uvicorn app.main:app --port 8000        # 开发时加 --reload 可热
 
 - 健康检查：http://127.0.0.1:8000/api/health
 - 接口文档（Swagger）：http://127.0.0.1:8000/docs
+
+**七期岗位追踪定时链路（可选，需 Redis）**：另开两个终端，在 `apps\api` 下分别执行（Windows 下 worker 用 `--pool=solo`）：
+
+```powershell
+python -m celery -A app.celery_app.celery_app worker --pool=solo -l info
+python -m celery -A app.celery_app.celery_app beat -l info
+```
+
+beat 每日 `TRACKING_HOUR`（默认 9 点）触发 worker 跑「订阅检索 → diff 新岗位 → 匹配分过滤 → 站内推送 → 看板下架探测」管线；不启动这两个进程时，其余功能全部正常，岗位追踪可在页面上「立即运行一次」（走 `POST /api/tracking/run`，与定时跑同一套管线）。注意 worker 与 API 是两个进程，**岗位追踪依赖 MySQL 持久化跨进程共享订阅数据**（纯内存模式下定时链路自然空转，手动触发不受影响）。
 
 ### 5. 启动前端
 
@@ -196,6 +208,9 @@ npm run dev
 | `ASR_THREADS` | `4` | 本地 ASR（SenseVoice）推理线程数；4 线程实测约 22 倍实时 |
 | `ASR_MODEL_ID` | `sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17` | 本地 ASR 模型 id（`apps/api/models/<id>/`） |
 | `RECORDINGS_DIR` | `apps/api/recordings` | 面试录音留存目录（仅逐场显式开启才落盘，已 gitignored；DB 只存相对路径） |
+| `CELERY_BROKER_URL` | `redis://localhost:6379/0` | 【七期】Celery broker（Redis）；未部署 Redis 时仅岗位追踪定时链路不可用 |
+| `TRACKING_HOUR` | `9` | 【七期】每日岗位追踪触发时刻（24 小时制，Celery beat crontab） |
+| `TRACKING_PROBE_BATCH` | `10` | 【七期】每日下架探测轮转批量（boss detail 受节流约束，按最久未探测优先取批） |
 
 完整清单与接口列表见 [apps/api/README.md](./apps/api/README.md)。
 
@@ -226,6 +241,7 @@ npm run dev
 - [x] v0.4 求职看板（四列状态机 + 回收站 + 面试临近提醒）+ 引擎 B 两阶段匹配评分漏斗 + 单岗位专属预测题（看板一键生成，引擎 C 子集）+ 检索卡「岗位要求」+ 检索缓存 TTL 收紧为 1 天
 - [x] v0.5 语音模拟面试（Web）：本地 SenseVoice 离线 ASR + 云端 Qwen3-TTS-Flash 实时合成 + 动态出题 + STAR 四维评估 + 命中关键词 + 一层追问 + 四维雷达复盘 + 录音逐场显式开启/回放 + 无麦克风/弱网/ASR 未下载降级文字
 - [ ] v0.6 引擎 C 完整三通道（链接 / 截图 / 粘贴文本）+ 岗位匹配度报告（含「结合我的简历生成」开关与缺口题包）（自 v0.5 拆期，掌握度图谱入产品文档 6.6 远期）
+- [x] v0.7 Agent 化改造（七期）：岗位追踪自主（订阅 CRUD + Celery beat 每日定时 + 立即运行一次；高分逐条/低分汇总/下架探测三类推送，环境不可用静默中止）+ 面试对话动态追问（STAR 四维评分驱动、上限 2 轮、报告追问质量分析）+ 自研轻量 Agent 运行时（`app/agent_runtime.py`，非 LangGraph）
 - [ ] v1.0 小程序端
 
 ## 许可证

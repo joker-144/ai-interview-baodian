@@ -521,6 +521,15 @@ class RuntimeState:
     interview_sessions: dict[str, dict[str, Any]] = field(default_factory=dict)
     # 岗位匹配度报告（六期）：user_id -> [报告行]（倒序最新在前，与 db.jd_reports 同构）
     jd_reports: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    # 面试追问轮次（七期内存兜底）：answer_id -> [轮次行]（MySQL 可用时以库为准，见 interview_turns）
+    turns_by_answer: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    # 岗位追踪订阅（七期）：user_id -> [订阅行]（与 db.job_subscriptions 同构，内存镜像 + MySQL 双写）
+    job_subscriptions: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    # 订阅追踪状态（七期）：sub_id -> {subId, userId, seenIds, lastRunAt, lastResult}
+    # （与 db.job_tracking_states 同构；seenIds 为 diff 基线）
+    tracking_states: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # 看板下架探测行（七期）：user_id -> {card_id -> 探测行}（与 db.job_offline_watch 同构）
+    offline_watch: dict[str, dict[str, dict[str, Any]]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """模型配置 / 历史 / 审计从 config/llm.json 恢复（不存在时由模板复制或走种子）。
@@ -869,8 +878,25 @@ NOTIFICATIONS_MAX = 200
 
 
 def user_notifications(user_id: str) -> list[dict[str, Any]]:
-    """该用户站内信（created_at 降序，最新在前）。"""
-    return state.notifications.get(user_id, [])
+    """该用户站内信（created_at 降序，最新在前）。
+
+    七期起 Celery worker 与 API 是两个进程：worker 直写 MySQL 的岗位推送通知
+    不会出现在 API 进程内存——库可用时做一次「按 id 增量合并」，库里多出的行
+    并入内存（db 读失败返回 []，无增量、不影响既有内存态；重复调用幂等）。
+    """
+    items = state.notifications.get(user_id, [])
+    if db.available():
+        fresh = db.load_notifications(user_id, NOTIFICATIONS_MAX)
+        known = {n["id"] for n in items}
+        delta = [n for n in fresh if n["id"] not in known]
+        if delta:
+            merged = sorted(
+                (*delta, *items),
+                key=lambda n: str(n.get("createdAt") or ""),
+                reverse=True,
+            )
+            items = state.notifications[user_id] = merged[:NOTIFICATIONS_MAX]
+    return items
 
 
 def add_notification(user_id: str, ntype: str, payload: dict[str, Any] | None = None) -> dict:
@@ -1075,6 +1101,11 @@ def persist_set_deletion(user_id: str, set_id: str) -> None:
 def purge_user_data(user_id: str) -> None:
     """注销执行：物理清理该用户全部数据行，并清空全站题库（与内存清理对齐）。"""
     state.jd_reports.pop(user_id, None)
+    # 七期：岗位追踪相关内存镜像随注销清理（库侧三表由 db.clear_user_data 直删）
+    state.job_subscriptions.pop(user_id, None)
+    for sub_id in [k for k, v in state.tracking_states.items() if v.get("userId") == user_id]:
+        state.tracking_states.pop(sub_id, None)
+    state.offline_watch.pop(user_id, None)
     db.clear_user_data(user_id)
     db.clear_bank()
 
@@ -1372,12 +1403,24 @@ def persist_interview_answer(answer: dict[str, Any]) -> None:
 
 
 def interview_turns(answer_id: str) -> list[dict[str, Any]]:
-    """某作答的全部追问轮次（按轮次升序）：MySQL 直查。"""
-    return db.load_interview_turns(answer_id)
+    """某作答的全部追问轮次（按轮次升序）：MySQL 直查为主，内存列表兜底
+    （纯内存模式下轮次此前不落任何地方，七期起补内存镜像，追问循环才可跨请求续轮）。"""
+    rows = db.load_interview_turns(answer_id)
+    if rows:
+        state.turns_by_answer[answer_id] = rows
+        return rows
+    return list(state.turns_by_answer.get(answer_id, []))
 
 
 def persist_interview_turn(turn: dict[str, Any]) -> None:
-    """追问轮次落库（append-only）。"""
+    """追问轮次落库（append-only）+ 内存镜像同步（按 id 幂等覆盖，轮次升序）。"""
+    turns = state.turns_by_answer.setdefault(turn["answerId"], [])
+    index = next((i for i, t in enumerate(turns) if t["id"] == turn["id"]), None)
+    if index is None:
+        turns.append(turn)
+    else:
+        turns[index] = turn
+    turns.sort(key=lambda t: t.get("turnNo", 0))
     db.save_interview_turn(turn)
 
 
@@ -1385,3 +1428,153 @@ def drop_interview_session(session_id: str) -> None:
     """彻底删除面试会话（内存 + 库级联清作答/追问；放弃/注销清理用）。"""
     state.interview_sessions.pop(session_id, None)
     db.delete_interview_session(session_id)
+
+
+# ---------------- 岗位追踪订阅（七期：内存镜像 + MySQL 双写） ----------------
+# API 进程与 Celery worker 经 MySQL 共享：worker 每轮运行前从库回源最新订阅与基线，
+# 手动触发（API 进程内）与定时触发写的是同一套 db 行，seenIds 幂等保证不重复推送。
+
+# 单用户订阅数上限（检索量与通知量保护）
+MAX_SUBSCRIPTIONS_PER_USER = 5
+# diff 基线容量：超出截最旧（securityId 无时间序，截尾即可）
+SEEN_IDS_CAP = 300
+
+
+def _subscriptions_ensure(user_id: str) -> list[dict[str, Any]]:
+    """取该用户订阅列表（内存未命中时从 db 回源并回填；db 瞬时失败重试一次）。"""
+    if user_id in state.job_subscriptions:
+        return state.job_subscriptions[user_id]
+    rows = db.load_subscriptions(user_id)
+    if rows is None:
+        rows = db.load_subscriptions(user_id)
+    state.job_subscriptions[user_id] = rows if rows is not None else []
+    return state.job_subscriptions[user_id]
+
+
+def subscriptions_of(user_id: str) -> list[dict[str, Any]]:
+    """该用户全部订阅（含停用；排序按创建时间升序）。"""
+    return list(_subscriptions_ensure(user_id))
+
+
+def subscription_find(user_id: str, sub_id: str) -> dict[str, Any] | None:
+    """按 id 查本人订阅；不存在/非本人返回 None。"""
+    return next((s for s in _subscriptions_ensure(user_id) if s["id"] == sub_id), None)
+
+
+def subscription_add(user_id: str, *, keyword: str, city: str, min_score: int) -> dict[str, Any]:
+    """新增订阅（上限 MAX_SUBSCRIPTIONS_PER_USER 由路由层校验）。"""
+    sub = {
+        "id": new_id("sub"),
+        "userId": user_id,
+        "keyword": keyword,
+        "city": city,
+        "enabled": True,
+        "minScore": int(min_score),
+        "createdAt": now_str(),
+        "updatedAt": now_str(),
+    }
+    _subscriptions_ensure(user_id).append(sub)
+    db.save_subscription(sub)
+    return sub
+
+
+def subscription_update(
+    user_id: str, sub_id: str, *, enabled: bool | None = None, min_score: int | None = None
+) -> dict[str, Any] | None:
+    """更新订阅（启停 / 阈值）；命中返回更新后的订阅，不存在返回 None。"""
+    sub = subscription_find(user_id, sub_id)
+    if sub is None:
+        return None
+    if enabled is not None:
+        sub["enabled"] = bool(enabled)
+    if min_score is not None:
+        sub["minScore"] = int(min_score)
+    sub["updatedAt"] = now_str()
+    db.save_subscription(sub)
+    return sub
+
+
+def subscription_remove(user_id: str, sub_id: str) -> bool:
+    """删除订阅（连带追踪状态）；命中返回 True。"""
+    subs = _subscriptions_ensure(user_id)
+    target = next((s for s in subs if s["id"] == sub_id), None)
+    if target is None:
+        return False
+    subs.remove(target)
+    state.tracking_states.pop(sub_id, None)
+    db.delete_subscription(sub_id)
+    return True
+
+
+def tracking_state_get(sub_id: str, user_id: str) -> dict[str, Any]:
+    """订阅的追踪状态（diff 基线 + 上次运行摘要）；无历史时给空基线。"""
+    cached = state.tracking_states.get(sub_id)
+    if cached is not None:
+        return cached
+    loaded = db.load_tracking_state(sub_id)
+    if loaded is None:
+        loaded = {"seenIds": [], "lastRunAt": "", "lastResult": None}
+    loaded = {"subId": sub_id, "userId": user_id, **loaded}
+    state.tracking_states[sub_id] = loaded
+    return loaded
+
+
+def tracking_state_put(tracking: dict[str, Any]) -> None:
+    """追踪状态写入（内存 + db 双写）；seenIds 超容量截最旧。"""
+    seen = list(tracking.get("seenIds") or [])
+    if len(seen) > SEEN_IDS_CAP:
+        tracking["seenIds"] = seen[-SEEN_IDS_CAP:]
+    state.tracking_states[tracking["subId"]] = tracking
+    db.save_tracking_state(tracking)
+
+
+def _offline_watch_ensure(user_id: str) -> dict[str, dict[str, Any]]:
+    """该用户探测行字典（card_id -> 行；内存未命中回源 db，失败重试一次）。"""
+    if user_id in state.offline_watch:
+        return state.offline_watch[user_id]
+    rows = db.load_offline_watch(user_id)
+    if rows is None:
+        rows = db.load_offline_watch(user_id)
+    state.offline_watch[user_id] = {r["cardId"]: r for r in (rows or [])}
+    return state.offline_watch[user_id]
+
+
+def offline_watch_sync(user_id: str, cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """以看板 zhipin 卡为准同步探测行：新卡补行（miss/delisted 计数保留）、
+    看板已删的卡剔除孤儿行；返回该用户全部探测行。"""
+    watch = _offline_watch_ensure(user_id)
+    valid_ids = {c["id"] for c in cards}
+    for card in cards:
+        row = watch.get(card["id"])
+        changed = False
+        if row is None:
+            row = {
+                "cardId": card["id"],
+                "userId": user_id,
+                "securityId": card.get("securityId", ""),
+                "jobName": card.get("jobName", ""),
+                "brand": card.get("brand", ""),
+                "missCount": 0,
+                "delisted": False,
+                "notifiedAt": "",
+                "lastProbeAt": "",
+            }
+            changed = True
+        else:
+            # 看板卡信息可能被用户编辑过，文案字段保持最新（探测计数不动）
+            for key in ("securityId", "jobName", "brand"):
+                if row.get(key) != card.get(key, ""):
+                    row[key] = card.get(key, "")
+                    changed = True
+        if changed:
+            db.save_offline_watch(row)
+        watch[card["id"]] = row
+    for card_id in [cid for cid in watch if cid not in valid_ids]:
+        watch.pop(card_id, None)
+        db.delete_offline_watch(card_id)
+    return list(watch.values())
+
+
+def offline_watch_put(row: dict[str, Any]) -> None:
+    """探测行回写（探测轮转后更新 miss/lastProbeAt 等字段；内存行已原地改，此处同步 db）。"""
+    db.save_offline_watch(row)

@@ -30,8 +30,13 @@ PyMySQL>=1.1
 # C 端鉴权：JWT 签发与校验（账号密码登录，见 app/auth.py）
 PyJWT>=2.8
 
+# 七期岗位追踪定时调度（Celery beat + Redis broker；原为二期预留注释，V2.12 启用）。
+# worker 启动（Windows 必须 --pool=solo）：celery -A app.celery_app worker --beat --pool=solo --loglevel=info
+# API 进程不 import celery 相关模块：未装 celery/redis 时仅定时链路不可用，接口不受影响。
+celery[redis]>=5.4
+redis>=5.0
+
 # 二期起接入（预留）：
 # sqlalchemy>=2.0
 # asyncpg
-# celery[redis]
 # langgraph

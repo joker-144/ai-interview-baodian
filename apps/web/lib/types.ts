@@ -301,6 +301,15 @@ export interface NotificationItem {
     jobName?: string;
     interviewAt?: string;
     cardId?: string;
+    /** 岗位追踪（七期）：订阅关键词 / 城市 / 匹配分与理由 / 下架提醒 */
+    keyword?: string;
+    city?: string;
+    reason?: string;
+    brand?: string;
+    salary?: string;
+    experience?: string;
+    securityId?: string;
+    samples?: string[];
   } | null;
   read: boolean;
   createdAt: string;
@@ -740,7 +749,7 @@ export interface InterviewAnswerResult {
   comment: string;
   durationSec: number;
   hasRecording: boolean;
-  /** 触发的一层追问文本（submit 响应携带；无则 null） */
+  /** 动态追问判定的第 1 轮追问文本（submit 响应携带；无则 null） */
   followUp?: string | null;
 }
 
@@ -749,6 +758,24 @@ export interface InterviewTurn {
   turnNo: number;
   role: "interviewer" | "candidate";
   transcript: string;
+  /** 七期：面试官追问的决策轨迹 / 候选人回答的 STAR 评分（旧数据无此键） */
+  meta?: Record<string, unknown> | null;
+}
+
+/** 追问质量分析（七期：动态追问循环的复盘统计） */
+export interface FollowupAnalysis {
+  answersWithFollowup: number;
+  totalRounds: number;
+  dynamicRounds: number;
+  improved: number;
+  items: {
+    seq: number;
+    rounds: number;
+    dynamic: number;
+    baseAverage: number;
+    lastAverage: number;
+    improved: boolean;
+  }[];
 }
 
 /** 复盘报告（primary 层生成：四维雷达 + 总评 + 优势 + 改进建议） */
@@ -758,6 +785,8 @@ export interface InterviewReport {
   summary: string;
   strengths: string[];
   improvements: string[];
+  /** 七期：追问质量分析（旧报告无此键） */
+  followup?: FollowupAnalysis;
 }
 
 /** 会话现场（创建 / GET /{id} 返回，含题目与已答明细） */

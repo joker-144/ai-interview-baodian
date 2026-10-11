@@ -369,15 +369,59 @@ CREATE TABLE IF NOT EXISTS interview_answers (
   KEY idx_itv_answers_session (session_id, seq)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '语音模拟面试作答（五期）';
 
--- 追问轮次：一层追问的面试官提问与候选人回答各一行（append-only）。
+-- 追问轮次：追问循环的面试官提问与候选人回答各一行（append-only；七期动态追问 ≤2 轮）。
 CREATE TABLE IF NOT EXISTS interview_turns (
   id          VARCHAR(64)  NOT NULL COMMENT '追问轮次 id（itvt-xxxxxxxx）',
   answer_id   VARCHAR(64)  NOT NULL COMMENT '所属作答 id',
   turn_no     INT          NOT NULL DEFAULT 1 COMMENT '轮次序号（1 基）',
   role        VARCHAR(16)  NOT NULL DEFAULT 'interviewer' COMMENT 'interviewer / candidate',
   transcript  MEDIUMTEXT   NULL COMMENT '本轮文本（面试官追问 / 候选人回答转写）',
+  meta_json   JSON         NULL COMMENT '轮次元数据（七期：追问决策轨迹 / 候选人回答 STAR 评分）',
   created_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
   KEY idx_itv_turns_answer (answer_id, turn_no)
-) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '语音模拟面试追问轮次（五期）';
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '语音模拟面试追问轮次（五期，七期补 meta_json）';
+
+-- ================= 七期（V2.12）：岗位追踪自主（Agent 化改造） =================
+-- 订阅（keyword+city+阈值）为定时检索主体；追踪状态存已见岗位 diff 基线；
+-- 下架探测表按 last_probe_at 升序轮转取批（受 boss detail 节流约束）。
+
+CREATE TABLE IF NOT EXISTS job_subscriptions (
+  id          VARCHAR(64)  NOT NULL COMMENT '订阅 id（sub-xxxxxxxx）',
+  user_id     VARCHAR(64)  NOT NULL COMMENT '所属用户（JWT sub）',
+  keyword     VARCHAR(64)  NOT NULL COMMENT '检索关键词',
+  city        VARCHAR(32)  NOT NULL DEFAULT '' COMMENT '城市（可空=全国）',
+  enabled     TINYINT(1)   NOT NULL DEFAULT 1 COMMENT '是否启用（停用则定时任务跳过）',
+  min_score   INT          NOT NULL DEFAULT 75 COMMENT '高分推送阈值（0~100，用户可配）',
+  created_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_subscriptions_user (user_id, enabled)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '岗位追踪订阅（七期）';
+
+CREATE TABLE IF NOT EXISTS job_tracking_states (
+  sub_id            VARCHAR(64) NOT NULL COMMENT '订阅 id',
+  user_id           VARCHAR(64) NOT NULL COMMENT '所属用户（注销清理直删用）',
+  seen_ids_json     JSON         NULL COMMENT '已见过的岗位 securityId 列表（diff 基线，封顶 300）',
+  last_run_at       DATETIME     NULL COMMENT '上次追踪运行时刻',
+  last_result_json  JSON         NULL COMMENT '上次运行摘要（新增/推送计数）',
+  updated_at        DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (sub_id),
+  KEY idx_tracking_user (user_id)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '岗位追踪状态（七期）';
+
+CREATE TABLE IF NOT EXISTS job_offline_watch (
+  card_id       VARCHAR(64)  NOT NULL COMMENT '看板卡 id（与 job_pipeline.id 同值）',
+  user_id       VARCHAR(64)  NOT NULL COMMENT '所属用户',
+  security_id   VARCHAR(512) NOT NULL COMMENT 'BOSS 岗位 security_id',
+  job_name      VARCHAR(128) NOT NULL DEFAULT '' COMMENT '岗位名（通知文案用）',
+  brand         VARCHAR(128) NOT NULL DEFAULT '' COMMENT '公司名（通知文案用）',
+  miss_count    INT          NOT NULL DEFAULT 0 COMMENT '连续详情失效次数（>=2 判下架，防单次抖动误报）',
+  delisted      TINYINT(1)   NOT NULL DEFAULT 0 COMMENT '是否已判定下架（判定后停止探测）',
+  notified_at   DATETIME     NULL COMMENT '下架提醒已推送时刻（防重复打扰）',
+  last_probe_at DATETIME     NULL COMMENT '最近一次探测时刻（轮转游标）',
+  created_at    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (card_id),
+  KEY idx_offline_watch_user (user_id, delisted)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '看板岗位下架探测（七期）';
 

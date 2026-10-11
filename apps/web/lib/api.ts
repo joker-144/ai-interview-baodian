@@ -57,6 +57,7 @@ import type {
   JdMatchReport,
   JdParseResult,
   SetJdMatchReport,
+  StarScores,
   UserProfile,
   UserSettings,
   WeekOverview,
@@ -1013,18 +1014,32 @@ export async function submitInterviewAnswer(
   );
 }
 
-/** 提交一层追问的作答（录音或文字），存为候选人轮次 */
+/** 提交追问轮作答（录音或文字），存为候选人轮次；七期未达上限时可返回下一轮追问 */
 export async function submitInterviewFollowup(
   sessionId: string,
   answerId: string,
   input: { file?: Blob; transcript?: string; durationSec?: number; retainAudio?: boolean },
-): Promise<{ ok: boolean; seq: number; transcript: string }> {
+): Promise<{
+  ok: boolean;
+  seq: number;
+  transcript: string;
+  starScores?: StarScores | null;
+  followUp?: string | null;
+  rounds?: number;
+}> {
   const form = new FormData();
   if (input.file) form.append("file", input.file, `followup-${answerId}.wav`);
   form.append("transcript", input.transcript ?? "");
   form.append("durationSec", String(input.durationSec ?? 0));
   form.append("retainAudio", input.retainAudio === false ? "false" : "true");
-  return apiFetch<{ ok: boolean; seq: number; transcript: string }>(
+  return apiFetch<{
+    ok: boolean;
+    seq: number;
+    transcript: string;
+    starScores?: StarScores | null;
+    followUp?: string | null;
+    rounds?: number;
+  }>(
     `/api/interview-sessions/${encodeURIComponent(sessionId)}/answers/${encodeURIComponent(answerId)}/followup`,
     { method: "POST", body: form },
   );
